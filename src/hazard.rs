@@ -1,35 +1,60 @@
+#![allow(unexpected_cfgs)]
+
+use crate::sync::atomic::{AtomicBool, AtomicPtr};
 use std::collections::HashSet;
 use std::convert::AsRef;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicPtr};
 
-pub(crate) static SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
-    list: HazPtrs {
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref SHARED_DOMAIN: GlobalDomain = GlobalDomain {
+            list: HazardList {
+                head: AtomicPtr::new(std::ptr::null_mut()),
+            },
+            ret: RetiredList {
+                head: AtomicPtr::new(std::ptr::null_mut()),
+            }
+    };
+}
+
+#[cfg(not(loom))]
+pub(crate) static SHARED_DOMAIN: GlobalDomain = GlobalDomain {
+    list: HazardList {
         head: AtomicPtr::new(std::ptr::null_mut()),
     },
-    ret: Retired {
+    ret: RetiredList {
         head: AtomicPtr::new(std::ptr::null_mut()),
     },
 };
 
 #[derive(Default)]
-pub struct HazPtrHolder(Option<&'static HazPtr>);
+pub struct Holder(Option<&'static Hazard>);
 
 pub struct Guard<'a, T> {
-    hazptr: &'static HazPtr,
+    hazptr: &'static Hazard,
     pub(crate) data: *mut T,
     _marker: PhantomData<&'a T>,
 }
 
+/// SAFETY:
+///    The caller must make sure that the reference is not used
+///    after the underlying thing has been deallocated as the
+///    lifetime of the reference given out in this case is
+///    unbounded.
 impl<T> AsRef<T> for Guard<'_, T> {
     fn as_ref(&self) -> &T {
-        &(*self)
+        unsafe { &(*self.data) }
     }
 }
 
+/// SAFETY:
+///    The caller must make sure that the reference is not used
+///    after the underlying thing has been deallocated as the
+///    lifetime of the reference given out in this case is
+///    unbounded.
 impl<T> Deref for Guard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
@@ -37,6 +62,13 @@ impl<T> Deref for Guard<'_, T> {
     }
 }
 
+/// SAFETY:
+///  This method can cause safety issues so it must be handled with care.
+///  If two threads deref_mut the guard to the same underlying T we will
+///  then have two mutable pointers to the same thing. If they are used to
+///  read or write at the same time, we will run into undefined behaviour.
+///  Further the lifetime of the mutable reference given out is unbounded.
+///  So it must be handled with care.
 impl<T> DerefMut for Guard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut (*self.data) }
@@ -47,18 +79,18 @@ impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
         self.hazptr
             .ptr
-            .store(std::ptr::null_mut(), Ordering::SeqCst);
-        self.hazptr.flag.store(true, Ordering::SeqCst);
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.hazptr.flag.store(true, Ordering::Release);
     }
 }
 
-impl HazPtrHolder {
+impl Holder {
     /// SAFETY:
     ///   1. The user must pass a valid pointer. Passing in invalid pointers such as a misaligned
     ///      one will cause undefined behaviour.
     ///   2. If a null pointer is passed that will be taken care of by the implementation as we
     ///      have made sure using NonNull that it does not get dereferenced.
-    pub unsafe fn load<'a, T>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
+    pub unsafe fn load_pointer<'a, T>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
         let hazptr = if let Some(t) = self.0 {
             t
         } else {
@@ -66,12 +98,12 @@ impl HazPtrHolder {
             self.0 = Some(ptr);
             ptr
         };
-        let mut ptr1 = ptr.load(Ordering::SeqCst);
+        let mut ptr1 = ptr.load(Ordering::Acquire);
         let ret = loop {
             hazptr.protect(ptr1 as *mut ());
-            let ptr2 = ptr.load(Ordering::SeqCst);
+            let ptr2 = ptr.load(Ordering::Acquire);
             if ptr1 == ptr2 {
-                if let Some(_) = NonNull::new(ptr1) {
+                if NonNull::new(ptr1).is_some() {
                     let data = ptr1;
                     break Some(Guard {
                         hazptr: &hazptr,
@@ -100,15 +132,18 @@ impl HazPtrHolder {
         atomic: &'_ AtomicPtr<T>,
         ptr: *mut T,
         deleter: &'static dyn Deleter,
-    ) -> Option<HazPtrObjectWrapper<'_, T>> {
-        let current = atomic.load(Ordering::SeqCst);
-        atomic.store(ptr, Ordering::SeqCst);
-        let wrapper = HazPtrObjectWrapper {
-            inner: current,
-            domain: &SHARED_DOMAIN,
-            deleter: deleter,
-        };
-        return Some(wrapper);
+    ) -> Option<DoerWrapper<'_, T>> {
+        let current = atomic.swap(ptr, Ordering::AcqRel);
+        if current.is_null() {
+            return None;
+        } else {
+            let wrapper = DoerWrapper {
+                inner: current,
+                domain: &SHARED_DOMAIN,
+                deleter: deleter,
+            };
+            return Some(wrapper);
+        }
     }
 
     ///SAFETY:
@@ -119,211 +154,175 @@ impl HazPtrHolder {
         &mut self,
         atomic: &'_ AtomicPtr<T>,
         deleter: &'static dyn Deleter,
-    ) -> Option<HazPtrObjectWrapper<'_, T>> {
-        let current = atomic.load(Ordering::SeqCst);
-        atomic.store(std::ptr::null_mut(), Ordering::SeqCst);
-        let wrapper = HazPtrObjectWrapper {
-            inner: current,
-            domain: &SHARED_DOMAIN,
-            deleter: deleter,
-        };
-        return Some(wrapper);
+    ) -> Option<DoerWrapper<'_, T>> {
+        let current = atomic.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if current.is_null() {
+            return None;
+        } else {
+            let wrapper = DoerWrapper {
+                inner: current,
+                domain: &SHARED_DOMAIN,
+                deleter: deleter,
+            };
+            return Some(wrapper);
+        }
+    }
+
+    fn get_domain() -> &'static GlobalDomain {
+        &SHARED_DOMAIN
+    }
+
+    pub fn try_reclaim() {
+        let domain = Self::get_domain();
+        unsafe {
+            domain.ret.reclaim(&domain.list);
+        }
     }
 }
 
-pub(crate) struct HazPtr {
+pub(crate) struct Hazard {
     ptr: AtomicPtr<()>,
-    next: AtomicPtr<HazPtr>,
+    next: AtomicPtr<Hazard>,
     flag: AtomicBool,
 }
 
-impl HazPtr {
+impl Hazard {
     pub fn protect(&self, ptr: *mut ()) {
-        self.ptr.store(ptr, Ordering::SeqCst);
+        self.ptr.store(ptr, Ordering::Release);
     }
 }
 
-pub(crate) trait HazPtrObject {
-    fn domain<'a>(&'a self) -> &'a HazPtrDomain;
+pub trait Doer {
+    fn domain<'a>(&'a self) -> &'a GlobalDomain;
     fn retire(&mut self);
 }
 
-pub(crate) struct HazPtrObjectWrapper<'a, T> {
-    inner: *mut T,
-    domain: &'a HazPtrDomain,
+pub struct DoerWrapper<'a, T> {
+    pub(crate) inner: *mut T,
+    domain: &'a GlobalDomain,
     deleter: &'static dyn Deleter,
 }
 
-impl<T> Deref for HazPtrObjectWrapper<'_, T> {
+impl<T> Deref for DoerWrapper<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &(*self.inner) }
     }
 }
 
-impl<T> DerefMut for HazPtrObjectWrapper<'_, T> {
+impl<T> DerefMut for DoerWrapper<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut (*self.inner) }
     }
 }
 
-impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
-    fn domain<'a>(&'a self) -> &'a HazPtrDomain {
+impl<T> Doer for DoerWrapper<'_, T> {
+    fn domain<'a>(&'a self) -> &'a GlobalDomain {
         self.domain
     }
 
     ///SAFETY:
     ///  The user must make sure that a retired pointer is not retired again.
     fn retire(&mut self) {
+        if self.inner.is_null() {
+            let domain = self.domain();
+            unsafe {
+                (&domain.ret).reclaim(&domain.list);
+            }
+            return;
+        }
         let domain = self.domain();
-        let current = (&domain.ret.head).load(Ordering::SeqCst);
+        let mut current = (&domain.ret.head).load(Ordering::Acquire);
         loop {
-            let ret = Ret {
+            let ret = Retired {
                 ptr: self.inner as *mut dyn Uniform,
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 deleter: self.deleter,
             };
-            if current.is_null() {
-                let boxed = Box::leak(Box::new(ret));
-                if domain
-                    .ret
-                    .head
-                    .compare_exchange(
-                        std::ptr::null_mut(),
-                        boxed,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
-                    .is_err()
-                {
-                    let drop = unsafe { Box::from_raw(boxed) };
-                    std::mem::drop(drop);
-                } else {
-                    unsafe { (&domain.ret).reclaim(&domain.list) };
-                    break;
-                }
+            ret.next.store(current, Ordering::Release);
+            let boxed = Box::into_raw(Box::new(ret));
+            if domain
+                .ret
+                .head
+                .compare_exchange(current, boxed, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                let drop = unsafe { Box::from_raw(boxed) };
+                current = (&domain.ret.head).load(Ordering::Acquire);
+                std::mem::drop(drop);
             } else {
-                ret.next.store(current, Ordering::SeqCst);
-                let boxed = Box::leak(Box::new(ret));
-                if domain
-                    .ret
-                    .head
-                    .compare_exchange(current, boxed, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
-                    let drop = unsafe { Box::from_raw(boxed) };
-                    std::mem::drop(drop);
-                } else {
-                    unsafe { (&domain.ret).reclaim(&domain.list) };
-                    break;
+                unsafe {
+                    (&domain.ret).reclaim(&domain.list);
                 }
+                break;
             }
         }
     }
 }
 
-pub struct HazPtrDomain {
-    list: HazPtrs,
-    ret: Retired,
+pub struct GlobalDomain {
+    list: HazardList,
+    ret: RetiredList,
 }
 
-impl HazPtrDomain {
-    pub fn acquire(&self) -> &'static HazPtr {
-        if self.list.head.load(Ordering::SeqCst).is_null() {
-            let hazptr = HazPtr {
-                ptr: AtomicPtr::new(std::ptr::null_mut()),
-                next: AtomicPtr::new(std::ptr::null_mut()),
-                flag: AtomicBool::new(false),
-            };
-            let raw = Box::into_raw(Box::new(hazptr));
-            if self
-                .list
-                .head
-                .compare_exchange(
-                    std::ptr::null_mut(),
-                    raw,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                return unsafe { &*raw };
-            } else {
-                let drop = unsafe { Box::from_raw(raw) };
-                std::mem::drop(drop);
-            }
-        }
-        let mut current = (&self.list.head).load(Ordering::SeqCst);
+impl GlobalDomain {
+    fn acquire(&self) -> &'static Hazard {
+        let mut current = (&self.list.head).load(Ordering::Acquire);
         while !current.is_null() {
             if unsafe { &(*current).flag }
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
                 return unsafe { &(*current) };
             } else {
-                current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
+                current = unsafe { (&(*current).next).load(Ordering::Acquire) };
             }
         }
-        let mut now = &self.list.head;
+
+        let mut now = self.list.head.load(Ordering::Acquire);
         loop {
-            let mut new = HazPtr {
+            let new = Hazard {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 flag: AtomicBool::new(false),
             };
-            new.next = AtomicPtr::new(now.load(Ordering::SeqCst));
+            new.next.store(now, Ordering::Release);
             let boxed = Box::into_raw(Box::new(new));
             if self
                 .list
                 .head
-                .compare_exchange(
-                    now.load(Ordering::SeqCst),
-                    boxed,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
+                .compare_exchange(now, boxed, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
                 return unsafe { &*boxed };
             } else {
-                now = &self.list.head;
                 let drop = unsafe { Box::from_raw(boxed) };
                 std::mem::drop(drop);
-                while !current.is_null() {
-                    let flag = unsafe { &(*current).flag };
-                    if flag
-                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
-                        return unsafe { &(*current) };
-                    } else {
-                        current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
-                    }
-                }
+                now = self.list.head.load(Ordering::Acquire);
             }
         }
     }
 }
 
-pub(crate) struct HazPtrs {
-    head: AtomicPtr<HazPtr>,
+pub(crate) struct HazardList {
+    head: AtomicPtr<Hazard>,
 }
 
-pub struct Retired {
-    head: AtomicPtr<Ret>,
+pub struct RetiredList {
+    head: AtomicPtr<Retired>,
 }
 
-pub(crate) trait Uniform {}
+pub trait Uniform {}
 
 impl<T> Uniform for T {}
 
-pub(crate) struct Ret {
+pub(crate) struct Retired {
     ptr: *mut dyn Uniform,
-    next: AtomicPtr<Ret>,
+    next: AtomicPtr<Retired>,
     deleter: &'static dyn Deleter,
 }
 
-pub(crate) trait Deleter {
+pub trait Deleter {
     fn delete(&self, ptr: *mut dyn Uniform);
 }
 
@@ -336,15 +335,15 @@ pub(crate) trait Deleter {
 ///      lifetime because we never know when the delete method on that deleter will be called.
 ///      Using static does not come with any memory overhead as the underlying type would be a zero
 ///      sized type.
-pub(crate) struct DropBox;
+pub struct BoxedPointer;
 
-impl DropBox {
+impl BoxedPointer {
     pub const fn new() -> Self {
-        DropBox
+        BoxedPointer
     }
 }
 
-impl Deleter for DropBox {
+impl Deleter for BoxedPointer {
     fn delete(&self, ptr: *mut dyn Uniform) {
         if let Some(_) = NonNull::new(ptr) {
             let drop = unsafe { Box::from_raw(ptr) };
@@ -353,7 +352,7 @@ impl Deleter for DropBox {
     }
 }
 
-pub(crate) struct DropPointer;
+pub struct DropPointer;
 
 impl DropPointer {
     pub const fn new() -> Self {
@@ -371,73 +370,79 @@ impl Deleter for DropPointer {
     }
 }
 
-impl Retired {
+impl RetiredList {
     /// SAFETY:
     ///    The user must make sure that the reclaim method is not called on the list of retired
     ///    pointers contaning two similar pointers as this will lead to the same pointers being
     ///    dereferenced leading to undefined behaviour.
-    unsafe fn reclaim<'a>(&self, domain: &'a HazPtrs) {
+    unsafe fn reclaim<'a>(&self, domain: &'a HazardList) {
         let mut set = HashSet::new();
-        let mut current = (&(domain.head)).load(Ordering::SeqCst);
+        let mut swapped = (self.head).swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let mut current = (&(domain.head)).load(Ordering::Acquire);
         while !current.is_null() {
-            let a = unsafe { (*current).ptr.load(Ordering::SeqCst) };
+            let a = unsafe { (*current).ptr.load(Ordering::Acquire) };
             set.insert(a);
-            current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
+            current = unsafe { (&(*current).next).load(Ordering::Acquire) };
         }
-        let mut remaining = std::ptr::null_mut();
-        let mut now = (self.head).swap(std::ptr::null_mut(), Ordering::SeqCst);
-        while !now.is_null() {
-            let check = unsafe { (*now).ptr };
+        let mut remaining: *mut Retired = std::ptr::null_mut();
+        while !swapped.is_null() {
+            let check = unsafe { (*swapped).ptr };
             if !set.contains(&(check as *mut ())) {
-                let deleter = unsafe { (*now).deleter };
+                let deleter = unsafe { (*swapped).deleter };
                 deleter.delete(check);
-                let go = now;
-                now = unsafe { ((*now).next).load(Ordering::SeqCst) };
-                let drop = unsafe { Box::from_raw(go) };
+                let to_be_dropped = swapped;
+                swapped = unsafe { ((*swapped).next).load(Ordering::Acquire) };
+                let drop = unsafe { Box::from_raw(to_be_dropped) };
                 std::mem::drop(drop);
             } else {
-                let next = unsafe { ((*now).next).load(Ordering::SeqCst) };
-                unsafe { (*now).next.store(remaining, Ordering::SeqCst) };
-                remaining = now;
-                now = next;
+                let next = unsafe { ((*swapped).next).load(Ordering::Acquire) };
+                if remaining.is_null() {
+                    remaining = swapped;
+                    unsafe {
+                        (*remaining)
+                            .next
+                            .store(std::ptr::null_mut(), Ordering::Release);
+                    }
+                } else {
+                    unsafe {
+                        (*swapped).next.store(remaining, Ordering::Release);
+                    }
+                    remaining = swapped;
+                }
+                swapped = next;
             }
         }
-        self.head.swap(remaining, Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    struct CountDrops(Arc<AtomicUsize>);
-    impl Drop for CountDrops {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
+        // we also need to make sure that we take care of all the pointers that have been retired
+        // in the meantime..therefore I came up with this solution
+        loop {
+            if self
+                .head
+                .compare_exchange(
+                    std::ptr::null_mut(),
+                    remaining,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return;
+            } else {
+                if remaining.is_null() {
+                    remaining = self.head.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                } else {
+                    let mut safety_variable = remaining;
+                    while unsafe { !(*safety_variable).next.load(Ordering::Acquire).is_null() } {
+                        safety_variable =
+                            unsafe { (*safety_variable).next.load(Ordering::Acquire) };
+                    }
+                    let to_be_swapped = self.head.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                    unsafe {
+                        (*safety_variable)
+                            .next
+                            .store(to_be_swapped, Ordering::Release);
+                    }
+                }
+            }
         }
-    }
-    impl CountDrops {
-        fn get_number_of_drops(&self) -> usize {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-    #[test]
-    fn test() {
-        let new = Arc::new(AtomicUsize::new(0));
-        let check = CountDrops(new.clone());
-        let value1 = CountDrops(new.clone());
-        let value2 = CountDrops(new.clone());
-        let boxed1 = Box::into_raw(Box::new(value1));
-        let boxed2 = Box::into_raw(Box::new(value2));
-        let atm_ptr = AtomicPtr::new(boxed1);
-        let mut holder = HazPtrHolder::default();
-        let guard = unsafe { holder.load(&atm_ptr) };
-        static DROPBOX: DropBox = DropBox::new();
-        std::mem::drop(guard);
-        if let Some(mut wrapper) = unsafe { holder.swap(&atm_ptr, boxed2, &DROPBOX) } {
-            wrapper.retire();
-        }
-        assert_eq!(check.get_number_of_drops(), 1 as usize);
     }
 }
