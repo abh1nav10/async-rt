@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+use crate::runtime::runtime::{Carrier, HIGH_QUEUE};
 use crate::runtime::waker::VTABLE;
 use std::cell::UnsafeCell;
 use std::future::Future;
@@ -10,9 +11,9 @@ use std::task::{Context, Poll, Waker};
 
 // States of a task
 const IDLE: usize = 0;
-const POLLING: usize = 0;
-const NOTIFIED: usize = 0;
-const COMPLETED: usize = 0;
+const POLLING: usize = 1;
+const NOTIFIED: usize = 2;
+const COMPLETED: usize = 3;
 
 struct JoinHandle<F>
 where
@@ -66,10 +67,10 @@ where
     }
 }
 
-struct Metadata {
+pub(crate) struct Metadata {
     state: AtomicUsize,
     refcount: AtomicUsize,
-    func: fn(*const ()),
+    pub(crate) func: fn(*const ()),
 }
 
 #[repr(C)]
@@ -137,6 +138,7 @@ where
                         NOTIFIED => {
                             state.store(POLLING, Ordering::Relaxed);
                             unsafe { ((*meta).func)(metadata) };
+                            break;
                         }
                         _ => unreachable!(),
                     }
@@ -164,6 +166,10 @@ where
         sender: tx,
         waker: Arc::clone(&waker),
     };
+    let boxed = Box::into_raw(Box::new(task));
+    let raw_metadata = unsafe { &(*boxed).metadata } as *const Metadata as *const ();
+    let carrier = Carrier::new(raw_metadata);
+    HIGH_QUEUE.enqueue(carrier);
     JoinHandle {
         handle: rx,
         waker: Arc::clone(&waker),

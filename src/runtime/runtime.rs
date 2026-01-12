@@ -1,10 +1,21 @@
 #![allow(unused)]
 
 use crate::Queue;
+use crate::runtime::executor::Metadata;
 use std::sync::LazyLock;
 use std::thread::JoinHandle;
 
-pub(crate) struct Carrier;
+pub(crate) struct Carrier {
+    data: *const (),
+}
+
+unsafe impl Send for Carrier {}
+
+impl Carrier {
+    pub(crate) fn new(data: *const ()) -> Self {
+        Self { data }
+    }
+}
 
 pub(crate) static HIGH_QUEUE: LazyLock<Queue<Carrier>> = LazyLock::new(Queue::new);
 
@@ -41,7 +52,12 @@ impl Runtime {
         (0..self.low_threads).map(|_| {
             let handle = std::thread::spawn(move || {
                 loop {
-                    // do something
+                    if let Ok(carrier) = LOW_QUEUE.dequeue() {
+                        let metadata = carrier.data as *const Metadata;
+                        unsafe {
+                            ((*metadata).func)(metadata as *const ());
+                        }
+                    }
                 }
             });
             low_handles.push(handle);
@@ -49,7 +65,12 @@ impl Runtime {
         (0..self.high_threads).map(|_| {
             let handle = std::thread::spawn(move || {
                 loop {
-                    // do something
+                    if let Ok(carrier) = HIGH_QUEUE.dequeue() {
+                        let metadata = carrier.data as *const Metadata;
+                        unsafe {
+                            ((*metadata).func)(metadata as *const ());
+                        }
+                    }
                 }
             });
             high_handles.push(handle);
