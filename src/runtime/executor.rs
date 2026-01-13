@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Waker};
 
 // States of a task
-const IDLE: usize = 0;
-const POLLING: usize = 1;
-const NOTIFIED: usize = 2;
-const COMPLETED: usize = 3;
+pub(crate) const IDLE: usize = 0;
+pub(crate) const POLLING: usize = 1;
+pub(crate) const NOTIFIED: usize = 2;
+pub(crate) const COMPLETED: usize = 3;
 
 struct JoinHandle<F>
 where
@@ -68,9 +68,10 @@ where
 }
 
 pub(crate) struct Metadata {
-    state: AtomicUsize,
-    refcount: AtomicUsize,
+    pub(crate) state: AtomicUsize,
+    pub(crate) refcount: AtomicUsize,
     pub(crate) func: fn(*const ()),
+    pub(crate) drop_func: fn(*const Metadata),
 }
 
 #[repr(C)]
@@ -146,6 +147,12 @@ where
             }
         }
     }
+
+    fn drop_task(data: *const Metadata) {
+        let task = data as *const Task<F>;
+        let owned = unsafe { Box::from_raw(task as *mut Task<F>) };
+        std::mem::drop(owned);
+    }
 }
 
 fn spawn<F>(future: F) -> JoinHandle<F>
@@ -157,6 +164,7 @@ where
         state: AtomicUsize::new(IDLE),
         refcount: AtomicUsize::new(0),
         func: Task::<F>::execute,
+        drop_func: Task::<F>::drop_task,
     };
     let waker = Arc::new(Mutex::new(None));
     let (tx, rx) = mpsc::channel::<F::Output>();
