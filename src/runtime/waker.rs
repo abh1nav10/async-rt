@@ -60,10 +60,40 @@ fn wake(data: *const ()) {
                     .is_ok()
                 {
                     refcount.fetch_sub(1, Ordering::Relaxed);
+                    // This following condition needs to be checked because after changing the
+                    // state from POLLING -> NOTIFIED, the thread might get prempted and wake up
+                    // after the task has been completed. It will then decrement the refcount
+                    // and if this condition is not checked we will leak the task allocation
+                    // if this was the last waker.
+                    if refcount.load(Ordering::Relaxed) == 0
+                        && state.load(Ordering::Relaxed) == COMPLETED
+                    {
+                        unsafe { (((*metadata).drop_func)(metadata)) };
+                    }
+                    break;
                 }
             }
-            NOTIFIED => {}
-            COMPLETED => {}
+            NOTIFIED => {
+                refcount.fetch_sub(1, Ordering::Relaxed);
+                // The reason for this check is similar to the reason for the check in POLLING
+                // case.
+                if refcount.load(Ordering::Relaxed) == 0
+                    && state.load(Ordering::Relaxed) == COMPLETED
+                {
+                    unsafe { ((*metadata).drop_func)(metadata) };
+                }
+                break;
+            }
+            COMPLETED => {
+                refcount.fetch_sub(1, Ordering::Relaxed);
+                // In this case we have to explicity check for the refcount because no more wakers
+                // are going to be created since the task is completed and this might as well be
+                // the last waker and if it simply decrements the refcount we will leak the task
+                if refcount.load(Ordering::Relaxed) == 0 {
+                    unsafe { ((*metadata).drop_func)(metadata) };
+                }
+                break;
+            }
             _ => unreachable!(),
         }
     }
