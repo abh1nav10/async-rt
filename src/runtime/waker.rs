@@ -97,7 +97,32 @@ fn wake(data: *const ()) {
 }
 
 fn wake_by_ref(data: *const ()) {
-    todo!()
+    let metadata = data as *const Metadata;
+    let state = unsafe { &(*metadata).state };
+    loop {
+        match state.load(Ordering::Relaxed) {
+            IDLE => {
+                if state
+                    .compare_exchange(IDLE, POLLING, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    HIGH_QUEUE.enqueue(Carrier::new(data));
+                    break;
+                }
+            }
+            POLLING => {
+                if state
+                    .compare_exchange(POLLING, NOTIFIED, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            NOTIFIED => break,
+            COMPLETED => break,
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn drop(data: *const ()) {
