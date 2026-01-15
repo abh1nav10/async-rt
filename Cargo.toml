@@ -1,19 +1,8 @@
 [package]
-name = "electron"
+name = "async-runtime"
 version = "0.1.0"
 edition = "2024"
-authors = ["Abhinav"]
+authors = ["abh1nav10"]
 
 [dependencies]
-
-[dev-dependencies]
-criterion = "0.7.0"
-
-[target.'cfg(loom)'.dependencies]
-loom = {version = "0.7", features = ["checkpoint"]}
-
-[[bench]]
-name = "benchmark"
-harness = false
-
-
+flume = "0.12"
