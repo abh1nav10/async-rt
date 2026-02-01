@@ -1,0 +1,151 @@
+#![allow(unused)]
+
+use crate::runtime::Carrier;
+use crate::waker::VTABLE;
+use std::cell::UnsafeCell;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::task::{Context, Poll, Waker};
+
+// States of a task
+pub(crate) const IDLE: usize = 0;
+pub(crate) const POLLING: usize = 1;
+pub(crate) const NOTIFIED: usize = 2;
+pub(crate) const COMPLETED: usize = 3;
+
+pub(crate) struct JoinHandle<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    pub(crate) handle: mpsc::Receiver<F::Output>,
+    pub(crate) waker: Arc<AtomicPtr<Waker>>,
+}
+
+impl<F> Future for JoinHandle<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // We first check whether the waker has been provided or not..
+        // If yes, that means this is the second poll in which case the value is
+        // guaranteed to be there because the execute function wakes up the waker
+        // only after the value has been sent...
+        //
+        // Further, if the waker is not there, then this is the first poll which either of
+        // the following
+        //   -- the output has been sent but the waking has not yet happened in which
+        //      case either the execute function misses the waker completely or it gets
+        //      it after this function places it in there.. in either of the the operations
+        //      are linearizable because in the former, the waker being missed implies that
+        //      the value is already sent which means that this function will read it and return
+        //      Poll::Ready.. the latter case implies that even if the joinhandle is polled
+        //      for once and returns Poll::Pending, it will definitely be polled again by the
+        //      execute fn
+        //
+        //   -- the execute function has sent the output but saw that no waker was there
+        //      which is completely fine because that means that the output will be read
+        //      on the first poll itself..
+        //
+        let ptr = self.waker.load(Ordering::SeqCst);
+        if ptr.is_null() {
+            let boxed = Box::into_raw(Box::new(cx.waker().clone()));
+            self.waker.store(boxed, Ordering::SeqCst);
+        }
+        if let Ok(output) = self.handle.try_recv() {
+            Poll::Ready(output)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+pub(crate) struct Metadata {
+    pub(crate) state: AtomicUsize,
+    pub(crate) refcount: AtomicUsize,
+    pub(crate) func: fn(*const ()),
+    pub(crate) drop_func: fn(*const Metadata),
+    pub(crate) sender: Arc<flume::Sender<Carrier>>,
+}
+
+#[repr(C)]
+pub(crate) struct Task<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    pub(crate) metadata: Metadata,
+    pub(crate) future: UnsafeCell<Option<Pin<Box<F>>>>,
+    pub(crate) sender: mpsc::Sender<F::Output>,
+    pub(crate) waker: Arc<AtomicPtr<Waker>>,
+}
+
+impl<F> Task<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    pub(crate) fn execute(metadata: *const ()) {
+        loop {
+            let meta = metadata as *const Metadata;
+            let task = meta as *const Task<F>;
+            let task_ref = unsafe { &(*task) };
+            let state = unsafe { &(*meta).state };
+            if let Some(future) = unsafe { &mut (*(task_ref).future.get()) } {
+                let pinned_future = future.as_mut();
+                let waker = unsafe { Waker::new(metadata, &VTABLE) };
+                let mut context = Context::from_waker(&waker);
+                let result = Future::poll(pinned_future, &mut context);
+                if let Poll::Ready(output) = result {
+                    let ptr = {
+                        task_ref.sender.send(output);
+                        task_ref.waker.load(Ordering::SeqCst)
+                    };
+                    // Its fine to not obtain the waker because even if that is the case
+                    // the value has already been sent and the joinhandle on being polled
+                    // for the very first time will obtain the value and return Poll::Ready.
+                    if !ptr.is_null() {
+                        unsafe {
+                            (*ptr).wake_by_ref();
+                        }
+                    }
+                    // We drop the future here itself as it has been polled to completion.
+                    unsafe {
+                        *(task_ref).future.get() = None;
+                    }
+                    // Since the wakers might drop the task after seeing the state
+                    // as COMPLETED, the dropping of the future must be visible to them
+                    // and hence we need to make the Ordering Release
+                    state.store(COMPLETED, Ordering::SeqCst);
+                    break;
+                }
+            }
+            match state.load(Ordering::SeqCst) {
+                POLLING => {
+                    if state
+                        .compare_exchange(POLLING, IDLE, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                NOTIFIED => {
+                    state.store(POLLING, Ordering::SeqCst);
+                    continue;
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    pub(crate) fn drop_task(data: *const Metadata) {
+        let task = data as *const Task<F>;
+        let owned = unsafe { Box::from_raw(task as *mut Task<F>) };
+        std::mem::drop(owned);
+    }
+}
