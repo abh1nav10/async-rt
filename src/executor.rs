@@ -1,12 +1,10 @@
-#![allow(unused)]
-
 use crate::runtime::Carrier;
 use crate::waker::VTABLE;
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
 
 // States of a task
@@ -123,7 +121,7 @@ where
                 let result = Future::poll(pinned_future, &mut context);
                 if let Poll::Ready(output) = result {
                     let ptr = {
-                        task_ref.sender.send(output);
+                        let _ = task_ref.sender.send(output);
                         task_ref.waker.load(Ordering::SeqCst)
                     };
                     // Its fine to not obtain the waker because even if that is the case

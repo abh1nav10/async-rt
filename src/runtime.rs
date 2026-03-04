@@ -1,10 +1,10 @@
-#![allow(unused)]
+#![allow(dead_code)]
 
 use crate::executor::{JoinHandle, Metadata, Task};
 use flume::{Receiver, Sender};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle as Join;
 
 pub(crate) struct Carrier {
@@ -19,13 +19,13 @@ impl Carrier {
     }
 }
 
-struct Runtime {
+pub struct Runtime {
     low: usize,
     high: usize,
 }
 
 impl Runtime {
-    fn start() -> RuntimeInstance {
+    pub fn start() -> RuntimeInstance {
         let allowed: usize = if let Ok(n) = std::thread::available_parallelism() {
             n.into()
         } else {
@@ -57,7 +57,20 @@ impl Runtime {
         }
     }
 
-    fn start_from_config(self) -> RuntimeInstance {
+    pub fn builder() -> RuntimeBuilder {
+        let allowed: usize = if let Ok(n) = std::thread::available_parallelism() {
+            n.into()
+        } else {
+            5
+        };
+        RuntimeBuilder {
+            high_threads: None,
+            low_threads: None,
+            allowed,
+        }
+    }
+
+    pub fn start_from_config(self) -> RuntimeInstance {
         let flag = Arc::new(AtomicBool::new(true));
         let (low_sender, low_receiver) = flume::unbounded::<Carrier>();
         let (high_sender, high_receiver) = flume::unbounded::<Carrier>();
@@ -154,7 +167,7 @@ impl Runtime {
     }
 }
 
-struct RuntimeInstance {
+pub struct RuntimeInstance {
     low_handles: Vec<Join<()>>,
     high_handles: Vec<Join<()>>,
     low_sender: Arc<Sender<Carrier>>,
@@ -162,14 +175,14 @@ struct RuntimeInstance {
     flag: Arc<AtomicBool>,
 }
 
-struct RuntimeBuilder {
+pub struct RuntimeBuilder {
     high_threads: Option<usize>,
     low_threads: Option<usize>,
     allowed: usize,
 }
 
 impl RuntimeBuilder {
-    fn low_priority_threads(&mut self, num: usize) {
+    pub fn low_priority_threads(&mut self, num: usize) {
         if num <= self.allowed {
             self.low_threads = Some(num);
             self.allowed -= num;
@@ -179,7 +192,7 @@ impl RuntimeBuilder {
         }
     }
 
-    fn high_priority_threads(&mut self, num: usize) {
+    pub fn high_priority_threads(&mut self, num: usize) {
         if num <= self.allowed {
             self.high_threads = Some(num);
             self.allowed -= num;
@@ -189,30 +202,15 @@ impl RuntimeBuilder {
         }
     }
 
-    fn build(self) -> Runtime {
+    pub fn build(self) -> Runtime {
         let low = self.low_threads.unwrap_or(1);
         let high = self.high_threads.unwrap_or(4);
         Runtime { low, high }
     }
 }
 
-impl Runtime {
-    fn builder() -> RuntimeBuilder {
-        let allowed: usize = if let Ok(n) = std::thread::available_parallelism() {
-            n.into()
-        } else {
-            5
-        };
-        RuntimeBuilder {
-            high_threads: None,
-            low_threads: None,
-            allowed,
-        }
-    }
-}
-
 impl RuntimeInstance {
-    fn spawn<F>(&self, future: F) -> JoinHandle<F>
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -235,14 +233,14 @@ impl RuntimeInstance {
         let boxed = Box::into_raw(Box::new(task));
         let raw_metadata = unsafe { &(*boxed).metadata } as *const Metadata as *const ();
         let carrier = Carrier::new(raw_metadata);
-        self.high_sender.send(carrier);
+        let _ = self.high_sender.send(carrier);
         JoinHandle {
             handle: rx,
             waker: Arc::clone(&waker),
         }
     }
 
-    fn spawn_low_priority<F>(&self, future: F) -> JoinHandle<F>
+    pub fn spawn_low_priority<F>(&self, future: F) -> JoinHandle<F>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -265,7 +263,7 @@ impl RuntimeInstance {
         let boxed = Box::into_raw(Box::new(task));
         let raw_metadata = unsafe { &(*boxed).metadata } as *const Metadata as *const ();
         let carrier = Carrier::new(raw_metadata);
-        self.low_sender.send(carrier);
+        let _ = self.low_sender.send(carrier);
         JoinHandle {
             handle: rx,
             waker: Arc::clone(&waker),
@@ -305,8 +303,7 @@ impl RuntimeInstance {
         }
     }
 
-    // Make this pub
-    fn shutdown(mut self) {
+    pub fn shutdown(mut self) {
         self.shutdown_private();
     }
 }

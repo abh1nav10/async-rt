@@ -1,10 +1,8 @@
-#![allow(unused)]
-
 use crate::executor::{COMPLETED, IDLE, Metadata, NOTIFIED, POLLING};
 use crate::runtime::Carrier;
 use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
-use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+use std::task::{RawWaker, RawWakerVTable};
 
 pub(crate) const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
 
@@ -49,7 +47,7 @@ fn wake(data: *const ()) {
                     // Doing it this way, makes sure that if the task is completed, and the
                     // refcount gets to zero, the task is dropped for sure.
                     refcount.fetch_sub(1, Ordering::SeqCst);
-                    sender.send(Carrier::new(data));
+                    let _ = sender.send(Carrier::new(data));
                     break;
                 }
             }
@@ -65,7 +63,7 @@ fn wake(data: *const ()) {
                     // and if this condition is not checked we will leak the task allocation
                     // if this was the last waker.
                     if prev == 1 && state.load(Ordering::SeqCst) == COMPLETED {
-                        unsafe { (((*metadata).drop_func)(metadata)) };
+                        unsafe { ((*metadata).drop_func)(metadata) };
                     }
                     break;
                 }
@@ -110,7 +108,7 @@ fn wake_by_ref(data: *const ()) {
                     .compare_exchange(IDLE, POLLING, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    sender.send(Carrier::new(data));
+                    let _ = sender.send(Carrier::new(data));
                     break;
                 }
             }
