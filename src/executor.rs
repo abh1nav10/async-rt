@@ -52,15 +52,33 @@ where
         //      which is completely fine because that means that the output will be read
         //      on the first poll itself..
         //
-        let ptr = self.waker.load(Ordering::SeqCst);
+        let mut ptr = self.waker.load(Ordering::SeqCst);
         if ptr.is_null() {
             let boxed = Box::into_raw(Box::new(cx.waker().clone()));
             self.waker.store(boxed, Ordering::SeqCst);
+            ptr = boxed;
         }
         if let Ok(output) = self.handle.try_recv() {
+            // At this point, ptr is not null, and the output has been received which means
+            // we must deallocate the waker allocation!
+            let d = unsafe { Box::from_raw(ptr) };
+            drop(d);
             Poll::Ready(output)
         } else {
             Poll::Pending
+        }
+    }
+}
+
+impl<F> Drop for JoinHandle<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn drop(&mut self) {
+        let ptr = self.waker.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        if !ptr.is_null() {
+            let _ = unsafe { Box::from_raw(ptr) };
         }
     }
 }
@@ -95,10 +113,12 @@ where
             let meta = metadata as *const Metadata;
             let task = meta as *const Task<F>;
             let task_ref = unsafe { &(*task) };
-            let state = unsafe { &(*meta).state };
+            let meta_ref = unsafe { &(*meta) };
+            let state = &meta_ref.state;
             if let Some(future) = unsafe { &mut (*(task_ref).future.get()) } {
                 let pinned_future = future.as_mut();
                 let waker = unsafe { Waker::new(metadata, &VTABLE) };
+                meta_ref.refcount.fetch_add(1, Ordering::SeqCst);
                 let mut context = Context::from_waker(&waker);
                 let result = Future::poll(pinned_future, &mut context);
                 if let Poll::Ready(output) = result {
