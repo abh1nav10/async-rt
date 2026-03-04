@@ -183,7 +183,7 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
-    pub fn low_priority_threads(&mut self, num: usize) {
+    pub fn low_priority_threads(mut self, num: usize) -> Self {
         if num <= self.allowed {
             self.low_threads = Some(num);
             self.allowed -= num;
@@ -191,9 +191,10 @@ impl RuntimeBuilder {
             self.low_threads = Some(1);
             self.allowed -= 1;
         }
+        self
     }
 
-    pub fn high_priority_threads(&mut self, num: usize) {
+    pub fn high_priority_threads(mut self, num: usize) -> Self {
         if num <= self.allowed {
             self.high_threads = Some(num);
             self.allowed -= num;
@@ -201,11 +202,12 @@ impl RuntimeBuilder {
             self.high_threads = Some(self.allowed - 1);
             self.allowed = 1;
         }
+        self
     }
 
     pub fn build(self) -> Runtime {
         let low = self.low_threads.unwrap_or(1);
-        let high = self.high_threads.unwrap_or(4);
+        let high = self.high_threads.unwrap_or(1);
         Runtime { low, high }
     }
 }

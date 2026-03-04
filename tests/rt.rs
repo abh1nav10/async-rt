@@ -1,7 +1,9 @@
 use async_runtime::runtime::Runtime;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 struct CounterFuture {
     count: usize,
@@ -31,5 +33,67 @@ fn check() {
         let output = fut.await;
         assert_eq!(output, 0);
     });
+    rt.shutdown();
+}
+
+struct CheckFuture {
+    waker: Arc<Mutex<Option<Waker>>>,
+    value: Arc<AtomicUsize>,
+}
+
+impl Future for CheckFuture {
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let value = self.value.load(Ordering::SeqCst);
+        if value > 0 {
+            Poll::Ready(value)
+        } else {
+            let mut guard = self.waker.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                let value = self.value.load(Ordering::SeqCst);
+                if value > 0 {
+                    Poll::Ready(value)
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn checkfut() {
+    let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+    let value = Arc::new(AtomicUsize::new(0));
+    let cloned = Arc::clone(&waker);
+    let cloned_value = Arc::clone(&value);
+    let handle = std::thread::spawn(move || {
+        loop {
+            let lock = cloned.lock().unwrap();
+            if let Some(ref waker) = *lock {
+                cloned_value.store(7, Ordering::SeqCst);
+                waker.wake_by_ref();
+                break;
+            }
+        }
+    });
+
+    let rt = Runtime::builder()
+        .high_priority_threads(1)
+        .low_priority_threads(1)
+        .build()
+        .start_from_config();
+
+    rt.block_on(async {
+        let check_fut = CheckFuture { waker, value };
+        let output = check_fut.await;
+        assert_eq!(output, 7);
+    });
+
+    handle.join().unwrap();
     rt.shutdown();
 }
