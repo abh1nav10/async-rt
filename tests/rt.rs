@@ -1,3 +1,8 @@
+// Tested with Valgrind!
+// `valgrind --tool=memcheck --track-origins=yes --verbose {..}`
+// where {} -> placeholder for the location of the test binary generated with
+// `cargo test --no-run`
+
 use async_runtime::runtime::Runtime;
 use std::future::Future;
 use std::pin::Pin;
@@ -84,7 +89,6 @@ fn checkfut() {
 
     let rt = Runtime::builder()
         .high_priority_threads(1)
-        .low_priority_threads(1)
         .build()
         .start_from_config();
 
@@ -96,4 +100,40 @@ fn checkfut() {
 
     handle.join().unwrap();
     rt.shutdown();
+}
+
+#[test]
+fn checkfut_spawn() {
+    let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+    let value = Arc::new(AtomicUsize::new(0));
+    let cloned = Arc::clone(&waker);
+    let cloned_value = Arc::clone(&value);
+    let handle = std::thread::spawn(move || {
+        loop {
+            let lock = cloned.lock().unwrap();
+            if let Some(ref waker) = *lock {
+                cloned_value.store(7, Ordering::SeqCst);
+                waker.wake_by_ref();
+                break;
+            }
+        }
+    });
+
+    let rt = Arc::new(
+        Runtime::builder()
+            .high_priority_threads(1)
+            .build()
+            .start_from_config(),
+    );
+
+    let cloned_rt = Arc::clone(&rt);
+
+    rt.block_on(async move {
+        let check_fut = CheckFuture { waker, value };
+        let handle = cloned_rt.spawn(check_fut);
+        let output = handle.await;
+        assert_eq!(output, 7);
+    });
+
+    handle.join().unwrap();
 }

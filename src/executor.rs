@@ -59,6 +59,7 @@ where
         if let Ok(output) = self.handle.try_recv() {
             // At this point, ptr is not null, and the output has been received which means
             // we must deallocate the waker allocation!
+            self.waker.store(std::ptr::null_mut(), Ordering::SeqCst);
             let d = unsafe { Box::from_raw(ptr) };
             drop(d);
             Poll::Ready(output)
@@ -142,22 +143,27 @@ where
                     state.store(COMPLETED, Ordering::SeqCst);
                     break;
                 }
-            }
-            match state.load(Ordering::SeqCst) {
-                POLLING => {
-                    if state
-                        .compare_exchange(POLLING, IDLE, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
-                        break;
+
+                match state.load(Ordering::SeqCst) {
+                    POLLING => {
+                        if state
+                            .compare_exchange(POLLING, IDLE, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            break;
+                        }
                     }
+                    NOTIFIED => {
+                        state.store(POLLING, Ordering::SeqCst);
+                        continue;
+                    }
+                    _ => unreachable!(),
                 }
-                NOTIFIED => {
-                    state.store(POLLING, Ordering::SeqCst);
-                    continue;
-                }
-                _ => unreachable!(),
             }
+            unreachable!(
+                "We should not reach here as that would mean that the task has been pushed on the
+            queue without the underlying future!"
+            );
         }
     }
 

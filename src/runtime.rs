@@ -30,7 +30,7 @@ impl Runtime {
         let allowed: usize = if let Ok(n) = std::thread::available_parallelism() {
             n.into()
         } else {
-            5
+            2
         };
         let flag = Arc::new(AtomicBool::new(true));
         let (low_sender, low_receiver) = flume::unbounded::<Carrier>();
@@ -183,24 +183,14 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
-    pub fn low_priority_threads(mut self, num: usize) -> Self {
-        if num <= self.allowed {
-            self.low_threads = Some(num);
-            self.allowed -= num;
-        } else {
-            self.low_threads = Some(1);
-            self.allowed -= 1;
-        }
-        self
-    }
-
     pub fn high_priority_threads(mut self, num: usize) -> Self {
-        if num <= self.allowed {
+        if num < self.allowed {
             self.high_threads = Some(num);
+            self.low_threads = Some(self.allowed - num);
             self.allowed -= num;
         } else {
             self.high_threads = Some(self.allowed - 1);
-            self.allowed = 1;
+            self.low_threads = Some(1);
         }
         self
     }
@@ -244,7 +234,8 @@ impl RuntimeInstance {
         F::Output: Send + 'static,
     {
         let metadata = Metadata {
-            state: AtomicUsize::new(crate::executor::IDLE),
+            // Because we will send the task on the queue, we must begin with the POLLING state!
+            state: AtomicUsize::new(crate::executor::POLLING),
             refcount: AtomicUsize::new(0),
             func: Task::<F>::execute,
             drop_func: Task::<F>::drop_task,
@@ -274,7 +265,8 @@ impl RuntimeInstance {
         F::Output: Send + 'static,
     {
         let metadata = Metadata {
-            state: AtomicUsize::new(crate::executor::IDLE),
+            // Because we will send the task on the queue, we must begin with the POLLING state!
+            state: AtomicUsize::new(crate::executor::POLLING),
             refcount: AtomicUsize::new(0),
             func: Task::<F>::execute,
             drop_func: Task::<F>::drop_task,
