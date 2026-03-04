@@ -13,7 +13,7 @@ pub(crate) const POLLING: usize = 1;
 pub(crate) const NOTIFIED: usize = 2;
 pub(crate) const COMPLETED: usize = 3;
 
-pub(crate) struct JoinHandle<F>
+pub struct JoinHandle<F>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,

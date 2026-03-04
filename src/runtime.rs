@@ -5,6 +5,7 @@ use flume::{Receiver, Sender};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
+use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle as Join;
 
 pub(crate) struct Carrier {
@@ -210,6 +211,31 @@ impl RuntimeBuilder {
 }
 
 impl RuntimeInstance {
+    pub fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let mut pinned_fut = Box::pin(future);
+
+        // Nightly feature!
+        //let waker = std::task::waker_fn(move || {
+        //    id.unpark();
+        //});
+
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        loop {
+            let fut = pinned_fut.as_mut();
+            if let Poll::Ready(output) = Future::poll(fut, &mut context) {
+                return output;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F>
     where
         F: Future + Send + 'static,
