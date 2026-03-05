@@ -3,8 +3,8 @@ use crate::waker::VTABLE;
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 // States of a task
@@ -18,7 +18,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    pub(crate) handle: mpsc::Receiver<F::Output>,
+    pub(crate) handle: flume::Receiver<F::Output>,
     pub(crate) waker: Arc<AtomicPtr<Waker>>,
 }
 
@@ -84,10 +84,11 @@ where
 
 pub(crate) struct Metadata {
     pub(crate) state: AtomicUsize,
-    pub(crate) refcount: AtomicUsize,
+    pub(crate) refcount: AtomicIsize,
     pub(crate) func: fn(*const ()),
     pub(crate) drop_func: fn(*const Metadata),
     pub(crate) sender: Arc<flume::Sender<Carrier>>,
+    pub(crate) mio_waker: Arc<mio::Waker>,
 }
 
 #[repr(C)]
@@ -98,7 +99,7 @@ where
 {
     pub(crate) metadata: Metadata,
     pub(crate) future: UnsafeCell<Option<Pin<Box<F>>>>,
-    pub(crate) sender: mpsc::Sender<F::Output>,
+    pub(crate) sender: flume::Sender<F::Output>,
     pub(crate) waker: Arc<AtomicPtr<Waker>>,
 }
 
@@ -111,15 +112,20 @@ where
         loop {
             let meta = metadata as *const Metadata;
             let task = meta as *const Task<F>;
+
             let task_ref = unsafe { &(*task) };
             let meta_ref = unsafe { &(*meta) };
             let state = &meta_ref.state;
+
             if let Some(future) = unsafe { &mut (*(task_ref).future.get()) } {
                 let pinned_future = future.as_mut();
                 let waker = unsafe { Waker::new(metadata, &VTABLE) };
+
                 meta_ref.refcount.fetch_add(1, Ordering::SeqCst);
+
                 let mut context = Context::from_waker(&waker);
                 let result = Future::poll(pinned_future, &mut context);
+
                 if let Poll::Ready(output) = result {
                     let ptr = {
                         let _ = task_ref.sender.send(output);
@@ -137,9 +143,6 @@ where
                     unsafe {
                         *(task_ref).future.get() = None;
                     }
-                    // Since the wakers might drop the task after seeing the state
-                    // as COMPLETED, the dropping of the future must be visible to them
-                    // and hence we need to make the Ordering Release
                     state.store(COMPLETED, Ordering::SeqCst);
                     break;
                 }
@@ -151,6 +154,15 @@ where
                             .is_ok()
                         {
                             break;
+                        } else {
+                            // We continue here, and if we don't continue we will the unreachable
+                            // code with that statement because if the CAS fails, we will just roll
+                            // over and hit that statement. Prevously this else branch and this
+                            // simple continue statement was not there and it cause me a lot of debugging
+                            // pain!
+                            //
+                            // Always double check the control flow!
+                            continue;
                         }
                     }
                     NOTIFIED => {

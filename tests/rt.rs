@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // Tested with Valgrind!
 // `valgrind --tool=memcheck --track-origins=yes --verbose {..}`
 // where {} -> placeholder for the location of the test binary generated with
@@ -132,6 +134,7 @@ fn checkfut_spawn() {
         let check_fut = CheckFuture { waker, value };
         let handle = cloned_rt.spawn(check_fut);
         let output = handle.await;
+        println!("Received output through channel. The output is {}", output);
         assert_eq!(output, 7);
     });
 

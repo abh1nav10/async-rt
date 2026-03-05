@@ -1,3 +1,5 @@
+#![feature(waker_fn)]
+
 mod executor;
 pub mod runtime;
 mod waker;

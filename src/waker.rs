@@ -14,9 +14,10 @@ fn clone(data: *const ()) -> RawWaker {
 
 fn wake(data: *const ()) {
     let metadata = data as *const Metadata;
-    let state = unsafe { &(*metadata).state };
-    let refcount = unsafe { &(*metadata).refcount };
-    let sender = unsafe { &(*metadata).sender };
+    let metadata = unsafe { &(*metadata) };
+    let state = &metadata.state;
+    let refcount = &metadata.refcount;
+    let sender = &metadata.sender;
     let sender = Arc::clone(sender);
     loop {
         match state.load(Ordering::SeqCst) {
@@ -47,7 +48,12 @@ fn wake(data: *const ()) {
                     // Doing it this way, makes sure that if the task is completed, and the
                     // refcount gets to zero, the task is dropped for sure.
                     refcount.fetch_sub(1, Ordering::SeqCst);
+
                     let _ = sender.send(Carrier::new(data));
+
+                    // We wake the worker thread up at this point after sending the task!
+                    let _ = metadata.mio_waker.wake();
+
                     break;
                 }
             }
@@ -62,8 +68,19 @@ fn wake(data: *const ()) {
                     // after the task has been completed. It will then decrement the refcount
                     // and if this condition is not checked we will leak the task allocation
                     // if this was the last waker.
-                    if prev == 1 && state.load(Ordering::SeqCst) == COMPLETED {
-                        unsafe { ((*metadata).drop_func)(metadata) };
+                    //
+                    // We CAS the refcount to -1 to prevent the possibility of this thread seeing
+                    // prev == 1, getting prempted, being woken up after state is COMPLETED and
+                    // dropping the task because in that scenario the new waker created in the
+                    // process of execution if woken up will lead to UB due to dangling pointer
+                    // dereference.
+                    if prev == 1
+                        && state.load(Ordering::SeqCst) == COMPLETED
+                        && refcount
+                            .compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        (metadata.drop_func)(metadata);
                     }
                     break;
                 }
@@ -73,8 +90,13 @@ fn wake(data: *const ()) {
                 let prev = refcount.fetch_sub(1, Ordering::SeqCst);
                 // The reason for this check is similar to the reason for the check in POLLING
                 // case.
-                if prev == 1 && state.load(Ordering::SeqCst) == COMPLETED {
-                    unsafe { ((*metadata).drop_func)(metadata) };
+                if prev == 1
+                    && state.load(Ordering::SeqCst) == COMPLETED
+                    && refcount
+                        .compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    (metadata.drop_func)(metadata);
                 }
                 break;
             }
@@ -86,8 +108,12 @@ fn wake(data: *const ()) {
                 // In this case we have to explicity check for the refcount because no more wakers
                 // are going to be created since the task is completed and this might as well be
                 // the last waker and if it simply decrements the refcount we will leak the task
-                if prev == 1 {
-                    unsafe { ((*metadata).drop_func)(metadata) };
+                if prev == 1
+                    && refcount
+                        .compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    (metadata.drop_func)(metadata);
                 }
                 break;
             }
@@ -109,6 +135,9 @@ fn wake_by_ref(data: *const ()) {
                     .is_ok()
                 {
                     let _ = sender.send(Carrier::new(data));
+
+                    // Wake the worker!
+                    let _ = metadata.mio_waker.wake();
                     break;
                 }
             }
@@ -129,8 +158,9 @@ fn wake_by_ref(data: *const ()) {
 
 fn drop(data: *const ()) {
     let metadata = data as *const Metadata;
-    let refcount = unsafe { &(*metadata).refcount };
-    let state = unsafe { &(*metadata).state };
+    let metadata = unsafe { &(*metadata) };
+    let refcount = &metadata.refcount;
+    let state = &metadata.state;
     let prev = refcount.fetch_sub(1, Ordering::SeqCst);
     // If we were to drop the task just by checking whether the waker refcount is zero,
     // we would be generating possibilites of Undefined behaviour as follows..
@@ -139,7 +169,20 @@ fn drop(data: *const ()) {
     // executed, the user just drops the other waker, the task will be dropped and when
     // the execute function is called by the executor, it would dereference a dangling pointer
     // and hence cause UB.
-    if prev == 1 && state.load(Ordering::SeqCst) == COMPLETED {
-        unsafe { ((*metadata).drop_func)(metadata) };
+    if prev == 1
+        && state.load(Ordering::SeqCst) == COMPLETED
+        && refcount
+            .compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        (metadata.drop_func)(metadata);
     }
 }
+
+//if prev == 1 && state.load(Ordering::SeqCst) == COMPLETED {
+//    if refcount.compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+//        // drop the task
+//    } else {
+//        // do nothing
+//    }
+//}
