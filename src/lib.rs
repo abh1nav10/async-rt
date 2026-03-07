@@ -5,5 +5,5 @@ mod net;
 pub mod runtime;
 mod waker;
 
-pub use crate::net::TcpListener;
+pub use crate::net::{TcpListener, TcpStream};
 pub use crate::runtime::Runtime;

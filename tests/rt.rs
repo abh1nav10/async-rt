@@ -145,36 +145,65 @@ impl Future for CheckFuture {
 //    handle.join().unwrap();
 //}
 
+#[allow(unused)]
 use async_runtime::TcpListener;
 use std::net::SocketAddr;
+//#[test]
+//fn bind_listener() {
+//    let rt = Runtime::builder()
+//        .high_priority_threads(1)
+//        .build()
+//        .start_from_config();
+//
+//    let socketaddr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+//
+//    let handle = std::thread::spawn(move || {
+//        loop {
+//            if std::net::TcpStream::connect(socketaddr).is_ok() {
+//                break;
+//            }
+//            std::thread::sleep(std::time::Duration::from_millis(50));
+//        }
+//    });
+//
+//    rt.block_on(async move {
+//        let listener = TcpListener::accept(socketaddr).unwrap();
+//
+//        let output = listener.await;
+//
+//        // The very fact the we reach here makes the test pass! The following assertion is useless!
+//        assert!(output.is_ok() | output.is_err());
+//    });
+//
+//    drop(rt);
+//
+//    handle.join().unwrap();
+//}
+
+use async_runtime::TcpStream;
 #[test]
-fn bind_listener() {
+fn test_tcpstream() {
+    let socketaddr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+
+    let server = std::net::TcpListener::bind(socketaddr).unwrap();
+    let handle = std::thread::spawn(move || {
+        while server.accept().is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+
     let rt = Runtime::builder()
         .high_priority_threads(1)
         .build()
         .start_from_config();
 
-    let socketaddr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-
-    let handle = std::thread::spawn(move || {
-        loop {
-            if std::net::TcpStream::connect(socketaddr).is_ok() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    });
-
     rt.block_on(async move {
-        let listener = TcpListener::accept(socketaddr).unwrap();
+        let stream = TcpStream::connect(socketaddr).unwrap();
 
-        let output = listener.await;
+        let output = stream.await.unwrap();
 
-        // The very fact the we reach here makes the test pass! The following assertion is useless!
-        assert!(output.is_ok() | output.is_err());
+        assert_eq!(output.1, socketaddr);
     });
-
-    drop(rt);
 
     handle.join().unwrap();
 }

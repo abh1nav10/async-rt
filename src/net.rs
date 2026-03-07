@@ -88,7 +88,11 @@ impl Future for AcceptFuture {
             // since the wakeup has already been lost.
             map.lock().unwrap().insert(token, cx.waker().clone());
 
-            match registry.register(&mut self.listener, token, mio::Interest::READABLE) {
+            match registry.register(
+                &mut self.listener,
+                token,
+                mio::Interest::READABLE | mio::Interest::WRITABLE,
+            ) {
                 Ok(_) => {
                     self.first_poll = false;
 
@@ -124,6 +128,99 @@ impl TcpListener {
             listener,
             first_poll: true,
             // TODO: Handle token number generation!
+            token: mio::Token(token),
+        };
+        Ok(fut)
+    }
+}
+
+pub struct TcpStream;
+
+pub struct StreamConnectFuture {
+    // We use an `Option` only to use `Option::take` to take the stream out when returning `Poll::Ready`
+    stream: Option<mio::net::TcpStream>,
+    first_poll: bool,
+    token: mio::Token,
+}
+
+impl Future for StreamConnectFuture {
+    type Output = Result<(mio::net::TcpStream, core::net::SocketAddr), Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let provider = if let Some(provider) = PROVIDER.get() {
+            provider
+        } else {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        };
+
+        let token = self.token;
+
+        if self.first_poll {
+            let stream = self.stream.as_mut().expect("Has to be there");
+
+            let registry = provider.give_registry();
+            let map = provider.give_map();
+
+            map.lock().unwrap().insert(token, cx.waker().clone());
+
+            match registry.register(
+                stream,
+                token,
+                mio::Interest::READABLE | mio::Interest::WRITABLE,
+            ) {
+                Ok(_) => {
+                    self.first_poll = false;
+
+                    Poll::Pending
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Err(e) => Poll::Ready(Err(Error::new(e.kind(), e))),
+            }
+        } else {
+            let stream = self.stream.as_ref().expect("Has to be there!");
+            let take_error = stream.take_error();
+
+            // Following the documentation in `mio::net::TcpStream::connect`!
+            match take_error {
+                Ok(n) => {
+                    if n.is_none() {
+                        // The documentation asks us to check the peer_addr method!
+                        match stream.peer_addr() {
+                            Ok(addr) => {
+                                let stream = self.stream.take().expect("Has to be there!");
+                                Poll::Ready(Ok((stream, addr)))
+                            }
+
+                            // According to the documentation, we must check for ErrorKind::NotConnected or
+                            // libc::EINPROGRESS which also maps to ErrorKind::NotConnected. peer_addr
+                            // cannot return WOULDBLOCK as it is not an IO operation. The peer address is
+                            // either present or not present. That's it!
+                            Err(e) if e.kind() == ErrorKind::NotConnected => Poll::Pending,
+
+                            Err(e) => Poll::Ready(Err(Error::other(e))),
+                        }
+                    } else {
+                        Poll::Ready(Err(Error::other("Something went wrong!")))
+                    }
+                }
+                Err(e) => Poll::Ready(Err(Error::other(e))),
+            }
+        }
+    }
+}
+
+impl TcpStream {
+    pub fn connect(addr: std::net::SocketAddr) -> Result<StreamConnectFuture, Error> {
+        let stream = mio::net::TcpStream::connect(addr)?;
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+
+        let fut = StreamConnectFuture {
+            stream: Some(stream),
+            first_poll: true,
             token: mio::Token(token),
         };
         Ok(fut)
