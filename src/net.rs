@@ -12,17 +12,17 @@ use std::task::{Context, Poll, Waker};
 // TODO: Fix the following:
 // The current problem with this approach is that we cannot have multiple runtimes in the same
 // process as they all will end up sharing this PROVIDER and the operations will get corrupted!
-// Futhermore, I am current unwrapping on the initiliazation as it must happen exactly once when
+// Futhermore, I am currently unwrapping on the initiliazation as it must happen exactly once when
 // the reactor thread gets spawned. If the aforementioned scenario exists, the reactor thread of
 // other runtimes will just panic due to unwrap on an Err. Also, I not able to run multiple
-// tests currently as when I create a new runtime for each one of them and the reactor threads of
+// tests currently as when I create a new runtime for each one of them, the reactor threads of
 // those panic for the same reason! When run indpendently, all the tests pass!
 pub(crate) static PROVIDER: OnceLock<GlobalProvider> = OnceLock::new();
 
 // Currently using this as the source of unique tokens! I will be using the slab data structure in
 // the future once I study it properly which will then ensure token uniqueness at minimal cost as
 // the insertion operation will itself return the index at which the token was inserted which we
-// will then add to AVAILABLE_PARALLELISM to get the token number that we will use for our token1
+// will then add to AVAILABLE_PARALLELISM to get the token number that we will use for our token
 static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(AVAILABLE_PARALLELISM + 1);
 
 #[derive(Debug)]
@@ -43,13 +43,13 @@ impl GlobalProvider {
 
 pub struct TcpListener;
 
-pub struct BindFuture {
+pub struct AcceptFuture {
     listener: mio::net::TcpListener,
     first_poll: bool,
     token: mio::Token,
 }
 
-impl Drop for BindFuture {
+impl Drop for AcceptFuture {
     fn drop(&mut self) {
         let map = if let Some(provider) = PROVIDER.get() {
             provider.give_map()
@@ -63,7 +63,7 @@ impl Drop for BindFuture {
     }
 }
 
-impl Future for BindFuture {
+impl Future for AcceptFuture {
     type Output = Result<(mio::net::TcpStream, std::net::SocketAddr), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -116,11 +116,11 @@ impl Future for BindFuture {
 }
 
 impl TcpListener {
-    pub fn bind(addr: std::net::SocketAddr) -> Result<BindFuture, Error> {
+    pub fn accept(addr: std::net::SocketAddr) -> Result<AcceptFuture, Error> {
         let listener = mio::net::TcpListener::bind(addr)?;
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
 
-        let fut = BindFuture {
+        let fut = AcceptFuture {
             listener,
             first_poll: true,
             // TODO: Handle token number generation!

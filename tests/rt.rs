@@ -166,7 +166,7 @@ fn bind_listener() {
     });
 
     rt.block_on(async move {
-        let listener = TcpListener::bind(socketaddr).unwrap();
+        let listener = TcpListener::accept(socketaddr).unwrap();
 
         let output = listener.await;
 
