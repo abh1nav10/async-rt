@@ -143,6 +143,20 @@ pub struct StreamConnectFuture {
     token: mio::Token,
 }
 
+impl Drop for StreamConnectFuture {
+    fn drop(&mut self) {
+        let map = if let Some(provider) = PROVIDER.get() {
+            provider.give_map()
+        } else {
+            return;
+        };
+
+        // Mio deregisters the source on drop. So we only need to remove from the map!
+        // TODO: Get rid of unwrap.
+        map.lock().unwrap().remove(&self.token);
+    }
+}
+
 impl Future for StreamConnectFuture {
     type Output = Result<(mio::net::TcpStream, core::net::SocketAddr), Error>;
 
