@@ -144,6 +144,24 @@ where
                         *(task_ref).future.get() = None;
                     }
                     state.store(COMPLETED, Ordering::SeqCst);
+
+                    // Fixing a memory leak!
+                    // A scenario in which the executor creates a waker, and the caller immediately
+                    // drops the waker will lead to no wakers being around after the state is
+                    // transitioned to `COMPLETED`. Since we were previoously delegating the
+                    // responsibility of dropping the task only to the wakers, that scenario would
+                    // lead to memory leaks. This check followed by the CAS to ensure that we are
+                    // the only one dropping the task ensures that the task never leaks and is
+                    // dropped safely.
+                    if meta_ref.refcount.load(Ordering::SeqCst) == 0
+                        && meta_ref
+                            .refcount
+                            .compare_exchange(0, -1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        (meta_ref.drop_func)(meta);
+                    }
+
                     break;
                 }
 
