@@ -64,7 +64,7 @@ impl Drop for AcceptFuture {
 }
 
 impl Future for AcceptFuture {
-    type Output = Result<(mio::net::TcpStream, std::net::SocketAddr), Error>;
+    type Output = Result<(TcpStream, std::net::SocketAddr), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let provider = if let Some(provider) = PROVIDER.get() {
@@ -106,7 +106,10 @@ impl Future for AcceptFuture {
             }
         } else {
             match self.listener.accept() {
-                Ok(stream) => Poll::Ready(Ok(stream)),
+                Ok((stream, addr)) => {
+                    let stream = TcpStream::new(stream, token);
+                    Poll::Ready(Ok((stream, addr)))
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     // We do not need to reregister the waker as it points to the same task;
                     // map.lock().unwrap().insert(token, cx.waker().clone());
@@ -134,7 +137,13 @@ impl TcpListener {
     }
 }
 
-pub struct TcpStream;
+// TODO: Impl Drop!!
+// Must store the underlying mio::net::TcpStream and our registered token as we need them while
+// implementing traits like futures_util::AsyncRead etc.
+pub struct TcpStream {
+    pub(crate) stream: mio::net::TcpStream,
+    pub(crate) token: mio::Token,
+}
 
 pub struct StreamConnectFuture {
     // We use an `Option` only to use `Option::take` to take the stream out when returning `Poll::Ready`
@@ -158,7 +167,7 @@ impl Drop for StreamConnectFuture {
 }
 
 impl Future for StreamConnectFuture {
-    type Output = Result<(mio::net::TcpStream, core::net::SocketAddr), Error>;
+    type Output = Result<(TcpStream, core::net::SocketAddr), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let provider = if let Some(provider) = PROVIDER.get() {
@@ -206,6 +215,7 @@ impl Future for StreamConnectFuture {
                         match stream.peer_addr() {
                             Ok(addr) => {
                                 let stream = self.stream.take().expect("Has to be there!");
+                                let stream = TcpStream::new(stream, token);
                                 Poll::Ready(Ok((stream, addr)))
                             }
 
@@ -228,6 +238,10 @@ impl Future for StreamConnectFuture {
 }
 
 impl TcpStream {
+    fn new(stream: mio::net::TcpStream, token: mio::Token) -> Self {
+        Self { stream, token }
+    }
+
     pub fn connect(addr: std::net::SocketAddr) -> Result<StreamConnectFuture, Error> {
         let stream = mio::net::TcpStream::connect(addr)?;
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);

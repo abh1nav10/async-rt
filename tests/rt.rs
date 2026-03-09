@@ -9,7 +9,7 @@
 // arises on having multiple runtimes in the same process because of using a static that gets
 // shared between them. When run individually, all tests pass! It shall be fixed later.
 
-use async_runtime::runtime::Runtime;
+use async_runtime::Runtime;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -181,28 +181,99 @@ use std::net::SocketAddr;
 //}
 
 use async_runtime::TcpStream;
+//#[test]
+//fn test_tcpstream() {
+//    let socketaddr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+//
+//    let server = std::net::TcpListener::bind(socketaddr).unwrap();
+//    let handle = std::thread::spawn(move || {
+//        while server.accept().is_err() {
+//            std::thread::sleep(std::time::Duration::from_millis(50));
+//        }
+//    });
+//
+//    let rt = Runtime::builder()
+//        .high_priority_threads(1)
+//        .build()
+//        .start_from_config();
+//
+//    rt.block_on(async move {
+//        let stream = TcpStream::connect(socketaddr).unwrap();
+//
+//        let output = stream.await.unwrap();
+//
+//        assert_eq!(output.1, socketaddr);
+//    });
+//
+//    handle.join().unwrap();
+//}
+
 #[test]
-fn test_tcpstream() {
+fn check_read_write() {
     let socketaddr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
 
     let server = std::net::TcpListener::bind(socketaddr).unwrap();
     let handle = std::thread::spawn(move || {
-        while server.accept().is_err() {
+        loop {
+            if let Ok((mut c, _)) = server.accept() {
+                let buffer = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+                use std::io::Write;
+                let _ = c.write(&buffer);
+                c.flush().unwrap();
+
+                use std::io::Read;
+                let mut buffer = String::new();
+                loop {
+                    if c.read_to_string(&mut buffer).is_ok() {
+                        assert_eq!(buffer.as_str(), "Hello Abhinav");
+
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     });
 
-    let rt = Runtime::builder()
-        .high_priority_threads(1)
-        .build()
-        .start_from_config();
+    let rt = Arc::new(
+        Runtime::builder()
+            .high_priority_threads(1)
+            .build()
+            .start_from_config(),
+    );
+
+    let cloned_rt = Arc::clone(&rt);
 
     rt.block_on(async move {
-        let stream = TcpStream::connect(socketaddr).unwrap();
+        let output = cloned_rt.spawn(async move {
+            let stream = TcpStream::connect(socketaddr).unwrap();
 
-        let output = stream.await.unwrap();
+            let (mut stream, addr) = stream.await.unwrap();
 
-        assert_eq!(output.1, socketaddr);
+            let mut buffer = vec![0; 9];
+
+            use futures_util::AsyncReadExt;
+            stream.read_exact(&mut buffer).await.unwrap();
+
+            assert_eq!(buffer, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+            use futures_util::AsyncWriteExt;
+            let _ = stream.write_all(b"Hello Abhinav").await;
+
+            // Flushing here does nothing because we are not doing buffered writes, I anyway have just
+            // kept it here!
+            stream.flush().await.unwrap();
+
+            // We close the stream so that the listener gets the EOF and does not hang forever!
+            stream.close().await.unwrap();
+
+            assert_eq!(addr, socketaddr);
+        });
+
+        output.await;
     });
 
     handle.join().unwrap();

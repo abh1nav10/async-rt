@@ -1,8 +1,9 @@
 #![feature(waker_fn)]
 
 mod executor;
+mod io;
 mod net;
-pub mod runtime;
+mod runtime;
 mod waker;
 
 pub use crate::net::{TcpListener, TcpStream};

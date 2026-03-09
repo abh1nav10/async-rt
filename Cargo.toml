@@ -8,3 +8,4 @@ authors = ["abh1nav10"]
 flume = "0.12"
 mio = { version = "1.1.1", features = ["os-poll", "net"] }
 rand = "0.10"
+futures-util = {version = "0.3.32", features = ["io"]}
