@@ -28,7 +28,7 @@ static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(AVAILABLE_PARALLELISM + 1);
 #[derive(Debug)]
 pub(crate) struct GlobalProvider {
     pub(crate) registry: Arc<mio::Registry>,
-    pub(crate) map: Arc<Mutex<HashMap<mio::Token, Waker>>>,
+    pub(crate) map: Arc<Mutex<HashMap<mio::Token, Option<Waker>>>>,
 }
 
 impl GlobalProvider {
@@ -36,20 +36,23 @@ impl GlobalProvider {
         Arc::clone(&self.registry)
     }
 
-    pub(crate) fn give_map(&self) -> Arc<Mutex<HashMap<mio::Token, Waker>>> {
+    pub(crate) fn give_map(&self) -> Arc<Mutex<HashMap<mio::Token, Option<Waker>>>> {
         Arc::clone(&self.map)
     }
 }
 
-pub struct TcpListener;
-
-pub struct AcceptFuture {
+pub struct TcpListener {
     listener: mio::net::TcpListener,
+    token: mio::Token,
+}
+
+pub struct AcceptFuture<'a> {
+    listener: &'a mio::net::TcpListener,
     first_poll: bool,
     token: mio::Token,
 }
 
-impl Drop for AcceptFuture {
+impl Drop for AcceptFuture<'_> {
     fn drop(&mut self) {
         let map = if let Some(provider) = PROVIDER.get() {
             provider.give_map()
@@ -63,7 +66,7 @@ impl Drop for AcceptFuture {
     }
 }
 
-impl Future for AcceptFuture {
+impl Future for AcceptFuture<'_> {
     type Output = Result<(TcpStream, std::net::SocketAddr), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -76,64 +79,77 @@ impl Future for AcceptFuture {
 
         let token = self.token;
 
+        // Put the waker into the map so that the reactor wakes us up on receiving events!
         if self.first_poll {
-            let registry = provider.give_registry();
-
             let map = provider.give_map();
 
-            // We must first put the entry in the map before registering in order to prevent the
-            // possibility of the reactor being woken up by the OS, it seeing no waker for the
-            // underlying token due to us entering it into the map after registering the event with
-            // the Poll and ending up doing nothing. That would lead to the future never completing
-            // since the wakeup has already been lost.
-            map.lock().unwrap().insert(token, cx.waker().clone());
+            map.lock().unwrap().entry(token).and_modify(|e| {
+                *e = Some(cx.waker().clone());
+            });
 
-            match registry.register(
-                &mut self.listener,
-                token,
-                mio::Interest::READABLE | mio::Interest::WRITABLE,
-            ) {
-                Ok(_) => {
-                    self.first_poll = false;
+            self.first_poll = false;
+        }
 
-                    Poll::Pending
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-                Err(e) => Poll::Ready(Err(Error::new(e.kind(), e))),
+        match self.listener.accept() {
+            Ok((stream, addr)) => {
+                let stream = TcpStream::new(stream, token);
+                Poll::Ready(Ok((stream, addr)))
             }
-        } else {
-            match self.listener.accept() {
-                Ok((stream, addr)) => {
-                    let stream = TcpStream::new(stream, token);
-                    Poll::Ready(Ok((stream, addr)))
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    // We do not need to reregister the waker as it points to the same task;
-                    // map.lock().unwrap().insert(token, cx.waker().clone());
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // We do not need to reregister the waker as it points to the same task;
+                // map.lock().unwrap().insert(token, cx.waker().clone());
 
-                    Poll::Pending
-                }
-                Err(e) => Poll::Ready(Err(Error::new(e.kind(), e))),
+                Poll::Pending
             }
+            Err(e) => Poll::Ready(Err(Error::new(e.kind(), e))),
         }
     }
 }
 
 impl TcpListener {
-    pub fn accept(addr: std::net::SocketAddr) -> Result<AcceptFuture, Error> {
-        let listener = mio::net::TcpListener::bind(addr)?;
-        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    pub fn bind(addr: std::net::SocketAddr) -> Result<TcpListener, Error> {
+        let provider = PROVIDER
+            .get()
+            .ok_or(Error::other("Could not find PROVIDER, try again!"))?;
 
-        let fut = AcceptFuture {
-            listener,
+        let mut listener = mio::net::TcpListener::bind(addr)?;
+
+        let map = provider.give_map();
+        let registry = provider.give_registry();
+
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let token = mio::Token(token);
+
+        map.lock()
+            .expect("Got back a poisoned lock!")
+            .insert(token, None);
+
+        match registry.register(
+            &mut listener,
+            token,
+            mio::Interest::READABLE | mio::Interest::WRITABLE,
+        ) {
+            Ok(_) => {
+                let listener = TcpListener { listener, token };
+
+                Ok(listener)
+            }
+            Err(e) => {
+                map.lock()
+                    .expect("Got back a poisened lock!")
+                    .remove(&token);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn accept<'a>(&'a self) -> AcceptFuture<'a> {
+        AcceptFuture {
+            listener: &self.listener,
             first_poll: true,
             // TODO: Handle token number generation!
-            token: mio::Token(token),
-        };
-        Ok(fut)
+            token: self.token,
+        }
     }
 }
 
@@ -185,7 +201,7 @@ impl Future for StreamConnectFuture {
             let registry = provider.give_registry();
             let map = provider.give_map();
 
-            map.lock().unwrap().insert(token, cx.waker().clone());
+            map.lock().unwrap().insert(token, Some(cx.waker().clone()));
 
             match registry.register(
                 stream,

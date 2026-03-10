@@ -30,10 +30,14 @@ impl AsyncRead for TcpStream {
         // if we do not update the waker, our call will hang!
         let entry = guard
             .entry(self.token)
-            .or_insert_with(|| cx.waker().clone());
+            .or_insert_with(|| Some(cx.waker().clone()));
 
-        if !entry.will_wake(cx.waker()) {
-            *entry = cx.waker().clone();
+        if !entry
+            .as_ref()
+            .expect("We just inserted it if it was not there!")
+            .will_wake(cx.waker())
+        {
+            *entry = Some(cx.waker().clone());
         }
 
         drop(guard);
@@ -70,10 +74,14 @@ impl AsyncWrite for TcpStream {
 
         let entry = guard
             .entry(self.token)
-            .or_insert_with(|| cx.waker().clone());
+            .or_insert_with(|| Some(cx.waker().clone()));
 
-        if !entry.will_wake(cx.waker()) {
-            *entry = cx.waker().clone();
+        if !entry
+            .as_ref()
+            .expect("Must be there!")
+            .will_wake(cx.waker())
+        {
+            *entry = Some(cx.waker().clone());
         }
 
         drop(guard);
@@ -114,10 +122,14 @@ impl AsyncWrite for TcpStream {
         // following check will fail and we won't be cloning the waker!
         let entry = guard
             .entry(self.token)
-            .or_insert_with(|| cx.waker().clone());
+            .or_insert_with(|| Some(cx.waker().clone()));
 
-        if !entry.will_wake(cx.waker()) {
-            *entry = cx.waker().clone();
+        if !entry
+            .as_ref()
+            .expect("We inserted it if it was absent!")
+            .will_wake(cx.waker())
+        {
+            *entry = Some(cx.waker().clone());
         }
 
         drop(guard);

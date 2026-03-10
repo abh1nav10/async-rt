@@ -266,7 +266,9 @@ impl Runtime {
             .try_clone()
             .expect("Could not clone the registry of the instance of Poll for the reactor1");
 
-        let map = Arc::new(Mutex::new(HashMap::<mio::Token, std::task::Waker>::new()));
+        let map = Arc::new(Mutex::new(
+            HashMap::<mio::Token, Option<std::task::Waker>>::new(),
+        ));
 
         use crate::net::GlobalProvider;
 
@@ -306,8 +308,10 @@ impl Runtime {
                     // TODO: Get rid of the unwrap!
                     let guard = map.lock().unwrap();
 
-                    if let Some(waker) = guard.get(&token) {
-                        waker.wake_by_ref();
+                    if let Some(waker) = guard.get(&token)
+                        && let Some(w) = waker
+                    {
+                        w.wake_by_ref();
                     }
                 }
             }

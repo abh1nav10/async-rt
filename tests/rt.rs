@@ -168,10 +168,9 @@ use std::net::SocketAddr;
 //        }
 //    });
 //
+//    let listener = TcpListener::bind(socketaddr).unwrap();
 //    rt.block_on(async move {
-//        let listener = TcpListener::accept(socketaddr).unwrap();
-//
-//        let output = listener.await;
+//        let output = listener.accept().await;
 //
 //        // The very fact the we reach here makes the test pass! The following assertion is useless!
 //        assert!(output.is_ok() | output.is_err());

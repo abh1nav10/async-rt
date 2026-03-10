@@ -43,6 +43,11 @@ fn hyper_integrated() {
     );
     let cloned_rt = Arc::clone(&runtime);
 
+    // We bind the listener here because it is a blocking call. However we ensure that we do so
+    // after starting the runtime as only then will we have the registry to register the source
+    // into!
+    let listener = TcpListener::bind(socketaddr).unwrap();
+
     runtime.block_on(async move {
         let server_rt = Arc::clone(&cloned_rt);
 
@@ -50,8 +55,7 @@ fn hyper_integrated() {
         cloned_rt.spawn(async move {
             let executor = HyperExecutor::new(server_rt);
 
-            let listener = TcpListener::accept(socketaddr).unwrap();
-            let (stream, _) = listener.await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
 
             let service = ConnectionService;
 
@@ -62,7 +66,6 @@ fn hyper_integrated() {
         });
 
         // Client
-
         let client_rt = Arc::clone(&cloned_rt);
         cloned_rt.spawn(async move {
             let driver_rt = Arc::clone(&client_rt);
