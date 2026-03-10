@@ -52,20 +52,6 @@ pub struct AcceptFuture<'a> {
     token: mio::Token,
 }
 
-impl Drop for AcceptFuture<'_> {
-    fn drop(&mut self) {
-        let map = if let Some(provider) = PROVIDER.get() {
-            provider.give_map()
-        } else {
-            return;
-        };
-
-        // Mio deregisters the source on drop. So we only need to remove from the map!
-        // TODO: Get rid of unwrap.
-        map.lock().unwrap().remove(&self.token);
-    }
-}
-
 impl Future for AcceptFuture<'_> {
     type Output = Result<(TcpStream, std::net::SocketAddr), Error>;
 
@@ -79,10 +65,10 @@ impl Future for AcceptFuture<'_> {
 
         let token = self.token;
 
+        let map = provider.give_map();
+
         // Put the waker into the map so that the reactor wakes us up on receiving events!
         if self.first_poll {
-            let map = provider.give_map();
-
             map.lock().unwrap().entry(token).and_modify(|e| {
                 *e = Some(cx.waker().clone());
             });
@@ -96,8 +82,20 @@ impl Future for AcceptFuture<'_> {
                 Poll::Ready(Ok((stream, addr)))
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                // We do not need to reregister the waker as it points to the same task;
-                // map.lock().unwrap().insert(token, cx.waker().clone());
+                // Check and update the waker if needed!
+                let mut guard = map.lock().expect("Got back a poisoned Mutex!");
+
+                let entry = guard
+                    .entry(token)
+                    .or_insert_with(|| Some(cx.waker().clone()));
+
+                if !entry
+                    .as_ref()
+                    .expect("Has to be there")
+                    .will_wake(cx.waker())
+                {
+                    *entry = Some(cx.waker().clone());
+                }
 
                 Poll::Pending
             }
@@ -195,11 +193,12 @@ impl Future for StreamConnectFuture {
 
         let token = self.token;
 
+        let map = provider.give_map();
+
         if self.first_poll {
             let stream = self.stream.as_mut().expect("Has to be there");
 
             let registry = provider.give_registry();
-            let map = provider.give_map();
 
             map.lock().unwrap().insert(token, Some(cx.waker().clone()));
 
@@ -239,7 +238,24 @@ impl Future for StreamConnectFuture {
                             // libc::EINPROGRESS which also maps to ErrorKind::NotConnected. peer_addr
                             // cannot return WOULDBLOCK as it is not an IO operation. The peer address is
                             // either present or not present. That's it!
-                            Err(e) if e.kind() == ErrorKind::NotConnected => Poll::Pending,
+                            Err(e) if e.kind() == ErrorKind::NotConnected => {
+                                // Check if the waker needs to be updated!
+                                let mut guard = map.lock().expect("Got back a poisoned Mutex!");
+
+                                let entry = guard
+                                    .entry(token)
+                                    .or_insert_with(|| Some(cx.waker().clone()));
+
+                                if !entry
+                                    .as_ref()
+                                    .expect("Has to be there")
+                                    .will_wake(cx.waker())
+                                {
+                                    *entry = Some(cx.waker().clone());
+                                }
+
+                                Poll::Pending
+                            }
 
                             Err(e) => Poll::Ready(Err(Error::other(e))),
                         }
