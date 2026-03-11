@@ -117,9 +117,6 @@ impl AsyncWrite for TcpStream {
 
         let mut guard = map.lock().expect("Got back a poinsoned lock!");
 
-        // In this method, this check is required only on the first Poll because as we return
-        // Poll::Ready the future will be dropped and we wont Poll again! We anyway keep it as the
-        // following check will fail and we won't be cloning the waker!
         let entry = guard
             .entry(self.token)
             .or_insert_with(|| Some(cx.waker().clone()));
