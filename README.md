@@ -1,5 +1,30 @@
 # Implementation of an Async Runtime
 
+## Benchmark 
+
+### Run with-
+- `wrk -t4 -c1000 -d30s --latency`
+- Ran on ArchLinux on WSL2
+- The different server implementations used for the benchmark can be 
+  seen in the examples directory.
+
+### Results
+
+| Architecture | Req/sec | p50 | p75 | p90 | p99 | Errors |
+|---|---|---|---|---|---|---|
+| Single-threaded | 109,586 | 0.86ms | 1.42ms | 99.17ms | 923ms | 3,294,267 |
+| One-thread-per-connection | 13,545 | 9.48ms | 10.28ms | 11.15ms | 223ms | 407,287 |
+| *async-rt* | *312,071* | *2.92ms* | *3.34ms* | *3.81ms* | *5.58ms* | *0* |
+| Tokio | 411,404 | 1.45ms | 1.97ms | 2.62ms | 4.05ms | 0 |
+
+### Analysis
+
+- `async-rt` achieves almost *75%* of the throughput acheived by `Tokio`.
+- `async-rt`thread-per-connection server by a factor of 23.
+- *40x* better p99 tail-latency over the server with one thread per connection.  
+- Zero errors while handling connections!
+- Falls behind with a delta of *1.53ms* p99 tail latency compared to Tokio.
+
 ## Usage
 
 ```rust
