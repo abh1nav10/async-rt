@@ -98,7 +98,7 @@ where
     F::Output: Send + 'static,
 {
     pub(crate) metadata: Metadata,
-    pub(crate) future: UnsafeCell<Option<Pin<Box<F>>>>,
+    pub(crate) future: UnsafeCell<Option<F>>,
     pub(crate) sender: flume::Sender<F::Output>,
     pub(crate) waker: Arc<AtomicPtr<Waker>>,
 }
@@ -118,7 +118,10 @@ where
             let state = &meta_ref.state;
 
             if let Some(future) = unsafe { &mut (*(task_ref).future.get()) } {
-                let pinned_future = future.as_mut();
+                // # SAFETY:
+                // Since the task was allocated once and we never moved out of it, the future did not
+                // move and it is safe to construct Pin using the new_unchecked API.
+                let pinned_future = unsafe { Pin::new_unchecked(future) };
                 let waker = unsafe { Waker::new(metadata, &VTABLE) };
 
                 meta_ref.refcount.fetch_add(1, Ordering::SeqCst);

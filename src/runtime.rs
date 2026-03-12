@@ -411,11 +411,23 @@ impl RuntimeInstance {
         let (tx, rx) = flume::bounded::<F::Output>(1);
         let task = Task {
             metadata,
-            future: UnsafeCell::new(Some(Box::pin(future))),
+            // It is safe to store the move the future before the first Poll because that is where
+            // the Pin contract starts. From then on to the point before the drop handler for the
+            // future is called, moving it violates the Pinning contract and will lead to Undefined
+            // Behaviour. We are moving the future here because we have not polled yet. On the
+            // following step, we allocate the task and from that point onwards we never move out
+            // of the future till its dropped! For user implemented Futures that contain self
+            // referential types, they must ensure that the type that implements Future is not
+            // Unpin. Also if their type implements Drop, they must ensure that it first wraps the
+            // future in a Pin and then executes the drop logic as mentioned in the Pin documentation.
+            future: UnsafeCell::new(Some(future)),
             sender: tx,
             waker: Arc::clone(&waker),
         };
 
+        // Box allows moving by dereferencing. But we never reconstruct the Box until the time to
+        // deallocate the underlying memory. Hence the possibility of accidently moving the
+        // underlying value and hence the future is eliminated!!
         let boxed = Box::into_raw(Box::new(task));
         let raw_metadata = unsafe { &(*boxed).metadata } as *const Metadata as *const ();
         let carrier = Carrier::new(raw_metadata);
@@ -450,7 +462,7 @@ impl RuntimeInstance {
         let (tx, rx) = flume::bounded::<F::Output>(1);
         let task = Task {
             metadata,
-            future: UnsafeCell::new(Some(Box::pin(future))),
+            future: UnsafeCell::new(Some(future)),
             sender: tx,
             waker: Arc::clone(&waker),
         };
