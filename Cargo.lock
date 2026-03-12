@@ -19,6 +19,7 @@ dependencies = [
  "hyper-util",
  "mio",
  "rand",
+ "slab",
  "tokio",
 ]
 

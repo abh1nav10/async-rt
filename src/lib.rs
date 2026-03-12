@@ -1,5 +1,6 @@
 #![feature(waker_fn)]
 
+mod atomicwaker;
 mod executor;
 mod hyperr;
 mod io;
