@@ -11,10 +11,9 @@ include!(concat!(env!("OUT_DIR"), "/available.rs"));
 use crate::executor::{JoinHandle, Metadata, Task};
 use flume::{Receiver, Sender};
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle as Join;
 
@@ -266,15 +265,13 @@ impl Runtime {
             .try_clone()
             .expect("Could not clone the registry of the instance of Poll for the reactor1");
 
-        let map = Arc::new(Mutex::new(
-            HashMap::<mio::Token, Option<std::task::Waker>>::new(),
-        ));
+        let slab = Arc::new(crate::atomicwaker::Torque::new());
 
         use crate::net::GlobalProvider;
 
         let global_provider = GlobalProvider {
             registry: Arc::new(registry),
-            map,
+            slab,
         };
 
         // It is safe to unwrap here because we are sure that this thread is the only one
@@ -288,10 +285,10 @@ impl Runtime {
             .expect("mio::Waker for the reactor thread could not be created1");
 
         let handle = std::thread::spawn(move || {
-            let map = crate::net::PROVIDER
+            let slab = crate::net::PROVIDER
                 .get()
                 .expect("Must be there because we set it previosly!")
-                .give_map();
+                .give_slab();
 
             let mut events = mio::Events::with_capacity(1024);
             loop {
@@ -305,14 +302,10 @@ impl Runtime {
                 for event in events.iter() {
                     let token = event.token();
 
-                    // TODO: Get rid of the unwrap!
-                    let guard = map.lock().unwrap();
-
-                    if let Some(waker) = guard.get(&token)
-                        && let Some(w) = waker
-                    {
-                        w.wake_by_ref();
-                    }
+                    // We subtract (AVAILABLE_PARALLELISM + 1) because we added it while
+                    // registering as the slots upto AVAILABLE_PARALLELISM have been reserved for
+                    // the reactor and worker threads!
+                    slab.wake(token.0 - (AVAILABLE_PARALLELISM + 1));
                 }
             }
         });

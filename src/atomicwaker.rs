@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use slab::Slab;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -10,6 +8,7 @@ const IDLE: u8 = 0b00;
 const UPDATING: u8 = 0b01;
 const WAKING: u8 = 0b10;
 
+#[derive(Debug)]
 struct AtomicWaker {
     state: AtomicU8,
     waker: UnsafeCell<Option<Waker>>,
@@ -83,6 +82,8 @@ impl AtomicWaker {
         }
     }
 
+    // Waking becomes extremely fast because we are not contending on the lock whatsoever! We just
+    // execute a fetch_or on the state and if operate further only if the previous state was IDLE.
     fn wake(&self) {
         if self.state.fetch_or(WAKING, Ordering::SeqCst) == IDLE {
             // Since it is the reactor that wakes the tasks up, if it is waking the only two states
@@ -106,9 +107,16 @@ impl AtomicWaker {
     }
 }
 
+// We use an RwLock to wrap our Slab data structure. This reduces the problem of contention on a
+// lock on the hot path if the operations are read heavy. This can proove to be a performance
+// booster for our runtime both in terms of increased throughput and decreased tail latency!
+#[derive(Debug)]
 pub(crate) struct Torque {
     data: RwLock<Slab<Arc<AtomicWaker>>>,
 }
+
+unsafe impl Send for Torque {}
+unsafe impl Sync for Torque {}
 
 impl Default for Torque {
     fn default() -> Self {
@@ -142,6 +150,8 @@ impl Torque {
             return;
         };
 
+        // We drop the waker before performing the update operation on the AtomicWaker. This lets
+        // other threads continue their work on the Slab.
         drop(guard);
         atomic_waker.update(waker);
     }
@@ -154,6 +164,8 @@ impl Torque {
             return;
         };
 
+        // We drop the waker before performing the update operation on the AtomicWaker. This lets
+        // other threads continue their work on the Slab.
         drop(guard);
         atomic_waker.wake();
     }

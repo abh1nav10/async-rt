@@ -1,13 +1,12 @@
 #![allow(dead_code)]
 
+use crate::atomicwaker::Torque;
 use crate::runtime::AVAILABLE_PARALLELISM;
-use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Error, ErrorKind};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 
 // TODO: Fix the following:
 // The current problem with this approach is that we cannot have multiple runtimes in the same
@@ -19,16 +18,10 @@ use std::task::{Context, Poll, Waker};
 // those panic for the same reason! When run indpendently, all the tests pass!
 pub(crate) static PROVIDER: OnceLock<GlobalProvider> = OnceLock::new();
 
-// Currently using this as the source of unique tokens! I will be using the slab data structure in
-// the future once I study it properly which will then ensure token uniqueness at minimal cost as
-// the insertion operation will itself return the index at which the token was inserted which we
-// will then add to AVAILABLE_PARALLELISM to get the token number that we will use for our token
-static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(AVAILABLE_PARALLELISM + 1);
-
 #[derive(Debug)]
 pub(crate) struct GlobalProvider {
     pub(crate) registry: Arc<mio::Registry>,
-    pub(crate) map: Arc<Mutex<HashMap<mio::Token, Option<Waker>>>>,
+    pub(crate) slab: Arc<Torque>,
 }
 
 impl GlobalProvider {
@@ -36,8 +29,8 @@ impl GlobalProvider {
         Arc::clone(&self.registry)
     }
 
-    pub(crate) fn give_map(&self) -> Arc<Mutex<HashMap<mio::Token, Option<Waker>>>> {
-        Arc::clone(&self.map)
+    pub(crate) fn give_slab(&self) -> Arc<Torque> {
+        Arc::clone(&self.slab)
     }
 }
 
@@ -50,7 +43,6 @@ pub struct AcceptFuture<'a> {
     listener: &'a mio::net::TcpListener,
     token: mio::Token,
     stream: Option<mio::net::TcpStream>,
-    stream_token: mio::Token,
 }
 
 impl Future for AcceptFuture<'_> {
@@ -64,7 +56,7 @@ impl Future for AcceptFuture<'_> {
             return Poll::Pending;
         };
 
-        let map = provider.give_map();
+        let slab = provider.give_slab();
 
         // We must always register the new waker first before reading from the socket because
         // reading first and registering after encountering ` WouldBlock` presents in front of us
@@ -72,35 +64,30 @@ impl Future for AcceptFuture<'_> {
         // thredad gets prempted and the reactor receives events, it will keep waking up the wrong
         // waker and because that new information wont be read from the socket, its edge triggered
         // nature will cause to not get woken up anymore and our task stalls forever!
-        let mut guard = map.lock().expect("Got back a poisoned Mutex!");
-
-        let value = guard
-            .get_mut(&self.token)
-            .expect("We put the token while binding!");
-
-        let new_waker = cx.waker();
-
-        if let Some(waker) = value.as_ref() {
-            if !waker.will_wake(new_waker) {
-                *value = Some(new_waker.clone());
-            }
-        } else {
-            *value = Some(new_waker.clone());
-        }
-
-        // Drop the guard before proceeding further!
-        drop(guard);
+        //
+        // We subtract (AVAILABLE_PARALLELISM + 1) because we added it while registering!
+        slab.update(
+            self.token.0 - (AVAILABLE_PARALLELISM + 1),
+            cx.waker().clone(),
+        );
 
         match self.listener.accept() {
             Ok((mut stream, addr)) => {
                 let registry = provider.give_registry();
 
+                // We insert without waker because the stream that we receive when used for reading
+                // or writing will get its waker registered!
+                let token = slab.insert_without_waker();
+
+                // We add (AVAILABLE_PARALLELISM + 1) because everything upto available parallelism is
+                // reserved for the reactor and the worker threads registered with the registry!
+                let token = mio::Token((AVAILABLE_PARALLELISM + 1) + token);
+
                 // We have this tiny loop to register the stream with the Poll instance!
                 loop {
-                    // TODO: Fix this and fix the waker wakeup bugs!
                     match registry.register(
                         &mut stream,
-                        self.stream_token,
+                        token,
                         mio::Interest::READABLE | mio::Interest::WRITABLE,
                     ) {
                         Ok(_) => break,
@@ -112,7 +99,7 @@ impl Future for AcceptFuture<'_> {
                 }
 
                 // Return the stream with the `stream_token`
-                let stream = TcpStream::new(stream, self.stream_token);
+                let stream = TcpStream::new(stream, token);
                 Poll::Ready(Ok((stream, addr)))
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -133,15 +120,13 @@ impl TcpListener {
 
         let mut listener = mio::net::TcpListener::bind(addr)?;
 
-        let map = provider.give_map();
+        let slab = provider.give_slab();
         let registry = provider.give_registry();
 
-        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-        let token = mio::Token(token);
-
-        map.lock()
-            .expect("Got back a poisoned lock!")
-            .insert(token, None);
+        let token = slab.insert_without_waker();
+        // We add (AVAILABLE_PARALLELISM + 1) because everything upto available parallelism is reserved
+        // for the reactor and the worker threads registered with the registry!
+        let token = mio::Token((AVAILABLE_PARALLELISM + 1) + token);
 
         match registry.register(&mut listener, token, mio::Interest::READABLE) {
             Ok(_) => {
@@ -150,23 +135,18 @@ impl TcpListener {
                 Ok(listener)
             }
             Err(e) => {
-                map.lock()
-                    .expect("Got back a poisened lock!")
-                    .remove(&token);
+                slab.remove(token.0 - (AVAILABLE_PARALLELISM + 1));
                 Err(e)
             }
         }
     }
 
     pub fn accept<'a>(&'a self) -> AcceptFuture<'a> {
-        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-
         AcceptFuture {
             listener: &self.listener,
             // TODO: Handle token number generation!
             token: self.token,
             stream: None,
-            stream_token: mio::Token(token),
         }
     }
 }
@@ -183,20 +163,19 @@ pub struct StreamConnectFuture {
     // We use an `Option` only to use `Option::take` to take the stream out when returning `Poll::Ready`
     stream: Option<mio::net::TcpStream>,
     first_poll: bool,
-    token: mio::Token,
+    token: Option<mio::Token>,
 }
 
 impl Drop for StreamConnectFuture {
     fn drop(&mut self) {
-        let map = if let Some(provider) = PROVIDER.get() {
-            provider.give_map()
+        let slab = if let Some(provider) = PROVIDER.get() {
+            provider.give_slab()
         } else {
             return;
         };
 
         // Mio deregisters the source on drop. So we only need to remove from the map!
-        // TODO: Get rid of unwrap.
-        map.lock().unwrap().remove(&self.token);
+        slab.remove(self.token.expect("Must be there").0 - (AVAILABLE_PARALLELISM + 1));
     }
 }
 
@@ -211,23 +190,15 @@ impl Future for StreamConnectFuture {
             return Poll::Pending;
         };
 
-        let token = self.token;
-
-        let map = provider.give_map();
-
-        let mut guard = map.lock().expect("Got back a poisoned Mutex!");
-
-        // Re register the waker before reading!
-        let waker = cx.waker();
-        let entry = guard.entry(token).or_insert_with(|| Some(waker.clone()));
-
-        if !entry.as_ref().expect("Has to be there").will_wake(waker) {
-            *entry = Some(waker.clone());
-        }
-
-        drop(guard);
+        let slab = provider.give_slab();
 
         if self.first_poll {
+            // Insert the waker first before registering the stream!
+            let token = slab.insert(cx.waker().clone());
+            let token = mio::Token(token + (AVAILABLE_PARALLELISM + 1));
+
+            self.token = Some(token);
+
             let stream = self.stream.as_mut().expect("Has to be there");
 
             let registry = provider.give_registry();
@@ -249,6 +220,12 @@ impl Future for StreamConnectFuture {
                 Err(e) => Poll::Ready(Err(Error::new(e.kind(), e))),
             }
         } else {
+            let token = self
+                .token
+                .expect("Has to be there as we put it in the first poll!");
+            // Re register the waker before reading!
+            slab.update(token.0 - (AVAILABLE_PARALLELISM + 1), cx.waker().clone());
+
             let stream = self.stream.as_ref().expect("Has to be there!");
             let take_error = stream.take_error();
 
@@ -294,12 +271,11 @@ impl TcpStream {
 
     pub fn connect(addr: std::net::SocketAddr) -> Result<StreamConnectFuture, Error> {
         let stream = mio::net::TcpStream::connect(addr)?;
-        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
 
         let fut = StreamConnectFuture {
             stream: Some(stream),
             first_poll: true,
-            token: mio::Token(token),
+            token: None,
         };
         Ok(fut)
     }

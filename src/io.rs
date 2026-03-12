@@ -1,5 +1,6 @@
 use crate::TcpStream;
 use crate::net::PROVIDER;
+use crate::runtime::AVAILABLE_PARALLELISM;
 use futures_util::{AsyncRead, AsyncWrite};
 use std::io::{Error, ErrorKind};
 use std::io::{Read, Write};
@@ -20,27 +21,19 @@ impl AsyncRead for TcpStream {
             return Poll::Pending;
         };
 
-        let map = provider.give_map();
-
-        let mut guard = map.lock().expect("Got back a poinsoned lock!");
+        let slab = provider.give_slab();
 
         // We need to register the waker if `will_wake returns false` because if `poll_read`
         // returns Poll::Ready, the underlying future created by the method on the extension traits
         // like AsyncReadExt might get dropped and they might create a new one on the next call and
         // if we do not update the waker, our call will hang!
-        let entry = guard
-            .entry(self.token)
-            .or_insert_with(|| Some(cx.waker().clone()));
 
-        if !entry
-            .as_ref()
-            .expect("We just inserted it if it was not there!")
-            .will_wake(cx.waker())
-        {
-            *entry = Some(cx.waker().clone());
-        }
-
-        drop(guard);
+        // The stream was already registered by the `StreamConnectFuture`!
+        // We subtract (AVAILABLE_PARALLELISM + 1) because we added it while registering the stream!
+        slab.update(
+            self.token.0 - (AVAILABLE_PARALLELISM + 1),
+            cx.waker().clone(),
+        );
 
         match self.stream.read(buf) {
             Ok(n) => Poll::Ready(Ok(n)),
@@ -68,23 +61,13 @@ impl AsyncWrite for TcpStream {
             return Poll::Pending;
         };
 
-        let map = provider.give_map();
+        let slab = provider.give_slab();
 
-        let mut guard = map.lock().expect("Got back a poinsoned lock!");
-
-        let entry = guard
-            .entry(self.token)
-            .or_insert_with(|| Some(cx.waker().clone()));
-
-        if !entry
-            .as_ref()
-            .expect("Must be there!")
-            .will_wake(cx.waker())
-        {
-            *entry = Some(cx.waker().clone());
-        }
-
-        drop(guard);
+        // The stream was already registered by the `StreamConnectFuture`!
+        slab.update(
+            self.token.0 - (AVAILABLE_PARALLELISM + 1),
+            cx.waker().clone(),
+        );
 
         match self.stream.write(buf) {
             Ok(n) => Poll::Ready(Ok(n)),
@@ -113,23 +96,13 @@ impl AsyncWrite for TcpStream {
             return Poll::Pending;
         };
 
-        let map = provider.give_map();
+        let slab = provider.give_slab();
 
-        let mut guard = map.lock().expect("Got back a poinsoned lock!");
-
-        let entry = guard
-            .entry(self.token)
-            .or_insert_with(|| Some(cx.waker().clone()));
-
-        if !entry
-            .as_ref()
-            .expect("We inserted it if it was absent!")
-            .will_wake(cx.waker())
-        {
-            *entry = Some(cx.waker().clone());
-        }
-
-        drop(guard);
+        // The stream was already registered by the `StreamConnectFuture`!
+        slab.update(
+            self.token.0 - (AVAILABLE_PARALLELISM + 1),
+            cx.waker().clone(),
+        );
 
         // We try to shutdown the Write half of the connection!
         match self.stream.shutdown(Shutdown::Write) {
