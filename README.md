@@ -10,20 +10,37 @@
 
 ### Results
 
+- I was using a `Mutex<HashMap<mio::Token, Waker>>` previously to map the token with its 
+  waker. This was **async-rt(before)**.
+- I now use an `RwLock<Slab<AtomicWaker>>` after implementing `AtomicWaker` in the `atomicwaker.rs`
+  inspired from the implementation in the `futures` crate but catered to the features of this runtime.
+  This is **async-rt(now)**.
+
 | Architecture | Req/sec | p50 | p75 | p90 | p99 | Errors |
 |---|---|---|---|---|---|---|
 | Single-threaded | 109,586 | 0.86ms | 1.42ms | 99.17ms | 923ms | 3,294,267 |
 | One-thread-per-connection | 13,545 | 9.48ms | 10.28ms | 11.15ms | 223ms | 407,287 |
-| *async-rt* | *312,071* | *2.92ms* | *3.34ms* | *3.81ms* | *5.58ms* | *0* |
+| *async-rt(before)* | *312,071* | *2.92ms* | *3.34ms* | *3.81ms* | *5.58ms* | *0* |
+| **async-rt(now)** | **357,093** | **2.01ms** | **2.57ms** | **3.17ms** | **4.37ms** | **0** |
 | Tokio | 411,404 | 1.45ms | 1.97ms | 2.62ms | 4.05ms | 0 |
 
 ### Analysis
 
+##### Before
 - `async-rt` achieves almost *75%* of the throughput acheived by `Tokio`.
 - `async-rt`thread-per-connection server by a factor of 23.
 - *40x* better p99 tail-latency over the server with one thread per connection.  
 - Zero errors while handling connections!
 - Falls behind with a delta of *1.53ms* p99 tail latency compared to Tokio.
+
+##### After
+- `async-rt` achieves almost **87%** of the throughput acheived by `Tokio`.
+- `async-rt`thread-per-connection server by a factor of **26**.
+- **45x** better p99 tail-latency over the server with one thread per connection.  
+- Zero errors while handling connections!
+- Falls behind with a delta of just **0.32ms** p99 tail latency compared to Tokio.
+- Using `AtomicWaker` and the `Slab` data structure with `RwLock` increases  
+  throughput by **45k** requests/second and decreases p99 tail-latency by **1.21ms**.
 
 ## Usage
 
