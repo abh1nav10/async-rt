@@ -302,6 +302,12 @@ impl Runtime {
                 for event in events.iter() {
                     let token = event.token();
 
+                    if token.0 == AVAILABLE_PARALLELISM {
+                        // This is the reactor thread's token in which case we simply continue.
+                        // This stops the debug builds complaining about integer underflow.
+                        continue;
+                    }
+
                     // We subtract (AVAILABLE_PARALLELISM + 1) because we added it while
                     // registering as the slots upto AVAILABLE_PARALLELISM have been reserved for
                     // the reactor and worker threads!
