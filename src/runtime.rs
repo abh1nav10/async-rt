@@ -41,6 +41,7 @@ impl Runtime {
         let flag = Arc::new(AtomicBool::new(true));
         let (low_sender, low_receiver) = flume::unbounded::<Carrier>();
         let (high_sender, high_receiver) = flume::unbounded::<Carrier>();
+        let (high_sender2, high_receiver2) = flume::unbounded::<Carrier>();
         let arc_low_receiver = Arc::new(low_receiver);
         let arc_high_receiver = Arc::new(high_receiver);
         let low = Runtime::spawn_low_threads(
@@ -54,8 +55,8 @@ impl Runtime {
         let mut high = Runtime::spawn_high_threads(
             AVAILABLE_PARALLELISM - 1,
             Arc::clone(&flag),
-            Arc::clone(&arc_low_receiver),
             Arc::clone(&arc_high_receiver),
+            Arc::new(high_receiver2),
         );
 
         high.0.push(low.0);
@@ -70,7 +71,8 @@ impl Runtime {
         RuntimeInstance {
             high_handles: high.0,
             low_sender: Arc::new(low_sender),
-            high_sender: Arc::new(high_sender),
+            high_sender,
+            high_sender2: Arc::new(high_sender2),
             flag,
             worker_meta,
         }
@@ -88,6 +90,7 @@ impl Runtime {
         let flag = Arc::new(AtomicBool::new(true));
         let (low_sender, low_receiver) = flume::unbounded::<Carrier>();
         let (high_sender, high_receiver) = flume::unbounded::<Carrier>();
+        let (high_sender2, high_receiver2) = flume::unbounded::<Carrier>();
         let arc_low_receiver = Arc::new(low_receiver);
         let arc_high_receiver = Arc::new(high_receiver);
 
@@ -102,8 +105,8 @@ impl Runtime {
         let mut high = Runtime::spawn_high_threads(
             self.high,
             Arc::clone(&flag),
-            Arc::clone(&arc_low_receiver),
             Arc::clone(&arc_high_receiver),
+            Arc::new(high_receiver2),
         );
 
         high.0.push(low.0);
@@ -118,7 +121,8 @@ impl Runtime {
         RuntimeInstance {
             high_handles: high.0,
             low_sender: Arc::new(low_sender),
-            high_sender: Arc::new(high_sender),
+            high_sender,
+            high_sender2: Arc::new(high_sender2),
             flag,
             worker_meta,
         }
@@ -190,16 +194,18 @@ impl Runtime {
     fn spawn_high_threads(
         num: usize,
         flag: Arc<AtomicBool>,
-        low_rec: Arc<Receiver<Carrier>>,
         high_rec: Arc<Receiver<Carrier>>,
+        high_rec2: Arc<Receiver<Carrier>>,
     ) -> (Vec<Join<()>>, Vec<Arc<mio::Waker>>) {
         // +1 for the reactor thread
         let mut vector = Vec::with_capacity(AVAILABLE_PARALLELISM + 1);
 
         let handles = (1..=num)
             .map(|i| {
-                let rec_low = Arc::clone(&low_rec);
                 let rec_high = Arc::clone(&high_rec);
+
+                let rec_high2 = Arc::clone(&high_rec2);
+
                 let cloned_flag = Arc::clone(&flag);
 
                 let mio_token: mio::Token = mio::Token(i);
@@ -218,15 +224,21 @@ impl Runtime {
                         if !cloned_flag.load(Ordering::Relaxed) {
                             break;
                         }
+
                         while let Ok(t) = rec_high.try_recv() {
                             let metadata = t.data as *const Metadata;
                             unsafe { ((*metadata).func)(metadata as *const ()) }
                         }
-                        if let Ok(t) = rec_low.try_recv() {
+
+                        // This is the second channel on which we receive tasks which contain
+                        // futures ready to be polled! We receive on this channel only after the
+                        // first poll that is when wakers wake tasks!
+                        while let Ok(t) = rec_high2.try_recv() {
                             let metadata = t.data as *const Metadata;
                             unsafe { ((*metadata).func)(metadata as *const ()) }
-                        } else {
-                            match poll.poll(&mut events, None)//Some(std::time::Duration::from_millis(50)))
+                        }
+
+                        match poll.poll(&mut events, None)//Some(std::time::Duration::from_millis(50)))
                             {
                                 Ok(_) => {
                                     assert!(events.iter().next().is_some());
@@ -242,7 +254,6 @@ impl Runtime {
                                     panic!("Unexpected error {} occurred!", e);
                                 }
                             }
-                        }
                     }
                     while let Ok(t) = rec_high.try_recv() {
                         let metadata = t.data as *const Metadata;
@@ -322,7 +333,8 @@ impl Runtime {
 pub struct RuntimeInstance {
     high_handles: Vec<Join<()>>,
     low_sender: Arc<Sender<Carrier>>,
-    high_sender: Arc<Sender<Carrier>>,
+    high_sender: Sender<Carrier>,
+    high_sender2: Arc<Sender<Carrier>>,
     flag: Arc<AtomicBool>,
     worker_meta: WorkerMeta,
 }
@@ -404,7 +416,8 @@ impl RuntimeInstance {
             refcount: AtomicIsize::new(0),
             func: Task::<F>::execute,
             drop_func: Task::<F>::drop_task,
-            sender: Arc::clone(&self.high_sender),
+            // The wakers push tasks onto the second queue!
+            sender: Arc::clone(&self.high_sender2),
             mio_waker,
             // TODO: Think of an efficient way to wake workers up as in unconditionally waking them
             // up can end up being not very useful as by the time it wakes up some other worker
