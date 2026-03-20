@@ -18,5 +18,5 @@ fn main() {
 
     // Rerun the build script only if it changes because on any particular machine the amount of parallelism
     // is going to be same!
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=build.rs");
 }
